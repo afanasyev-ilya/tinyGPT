@@ -134,13 +134,16 @@ class MultiHeadAttention(nn.Module):
         k = apply_rope(k, cos, sin)
 
         if self.use_cache:
-            # write K/V to cache
+            # write K/V to cache. we use in-place concat here
+            # k is [B, H, T, D], T = 1
+            # we copy k into start = self.cache_index, end = self.cache_index + 1
             self.k_cache[:, :, start:end, :] = k
             self.v_cache[:, :, start:end, :] = v
             self.cache_index = end
 
-            k_full = self.k_cache[:, :, :self.cache_index, :]  # (B,H,L,D)
-            v_full = self.v_cache[:, :, :self.cache_index, :]
+            # we use a view here, from 0 to self.cache_index among T dim
+            k_full = self.k_cache[:, :, 0:self.cache_index, :]  # (B,H,L,D)
+            v_full = self.v_cache[:, :, 0:self.cache_index, :]
 
             # Causality handling:
             # - decode step (T=1): no future keys exist in k_full -> no mask needed
