@@ -12,17 +12,6 @@ n_heads = 6
 dropout = 0.2
 # ------------
 
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# hyperparameters (assumed to be defined elsewhere in your code)
-n_embd = 384      # embedding dimension (input channels)
-block_size = 256  # maximum sequence length (for masking)
-dropout = 0.2     # dropout rate
-
-
 class Head(nn.Module):
     def __init__(self, head_size, head_idx, block_idx, use_cache=True):
         """
@@ -65,73 +54,75 @@ class Head(nn.Module):
         # Compute scaled dot-product attention scores
         # shapes: TxHS * HSxT -> TxT
         # complexity: T * HS * T
-        wei = q @ k.transpose(-2, -1) * C ** -0.5  # (B, T, T)
+        wei = q @ k.transpose(-2, -1) * (self.head_size ** -0.5) # (B, T, T)
         
         # Apply causal mask: each token can only attend to previous tokens (including itself)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1) # (B, T, T)
         wei = self.dropout(wei)
 
-        # shapes: T x T * T x HS -> T x HS
+        # shapes: (T x T) * (T x HS) -> T x HS
         # complexity: T * HS * T
         out = wei @ v # (B, T, HS)
 
         # overall complexity: 3*T*C*HS + 2*T*HS*T
         return out
 
-    def forward_with_cache(self, x):
+    def forward_with_cache(self, x): # x is [B, T=1, n_embd]
         B, T, C = x.shape
+        head_size = self.head_size
+        device = x.device
+        dtype = x.dtype
 
+        # init cache
         if self.cache_k is None:
-            cache_was_empty = True
-            # Initial step: process all tokens and fill the cache
-            k = self.key(x)   # (B, T, HS)
-            v = self.value(x) # (B, T, HS)
-            q = self.query(x) # (B, T, HS)
+            self.cache_k = torch.empty(B, block_size, head_size, device=device, dtype=dtype)
+            self.cache_v = torch.empty(B, block_size, head_size, device=device, dtype=dtype)
+            self.cache_index = 0
 
-            self.cache_k = torch.zeros(B, 256, self.head_size, device='cuda:0')
-            self.cache_v = torch.zeros(B, 256, self.head_size, device='cuda:0')
+        # T = 1 for decode (KV cache case)
+        k = self.key(x)    # (B, T=1, head_size)
+        q = self.query(x)  # (B, T=1, head_size)
+        v = self.value(x)  # (B, T=1, head_size)
 
-            self.cache_k[:, :T, :] = k
-            self.cache_v[:, :T, :] = v
-        else:
-            cache_was_empty = False
-            # Subsequent steps: process only the new token (T should be 1)
-            x_new = x[:, -1:, :]  # (B, 1, C)
+        # use sliding window, but hard with current pos embed
+        #if self.cache_index + T > block_size:
+        #    print("out of windows")
+        #    exit(1)
 
-            # shapes: Bx1xC * BxCxHS -> Bx1xHS
-            # complexity: 1*C*HS
-            k_new = self.key(x_new)   # (B, 1, HS)
-            v_new = self.value(x_new) # (B, 1, HS)
-            q = self.query(x_new)     # (B, 1, HS)
+        self.cache_k[:, self.cache_index:(self.cache_index + T), :] = k
+        self.cache_v[:, self.cache_index:(self.cache_index + T), :] = v
+        self.cache_index += T
 
-            #self.cache_k = torch.cat([self.cache_k, k_new], dim=1)
-            #self.cache_v = torch.cat([self.cache_v, v_new], dim=1)
-            self.cache_k[:, self.cache_index, :] = k_new.squeeze(1)
-            self.cache_v[:, self.cache_index, :] = v_new.squeeze(1)
-            self.cache_index += 1
+        k_full = self.cache_k[:, :self.cache_index, :]
+        v_full = self.cache_v[:, :self.cache_index, :]
 
-            # TODO this is incorrect if we generate more than prompt size tokens, 
-            # since we lose positional embeddings
-            if self.cache_k.size(1) > 256:
-                self.cache_k = self.cache_k[:, 1:, :] # Remove the token at T=0
-                self.cache_v = self.cache_v[:, 1:, :]
+        #print(f"k = {k.shape}, cache_k = {self.cache_k.shape}, k_full = {k_full.shape}")
+        #print(f"q = {q.shape}")
 
         # Compute attention scores
         # shapes: Bx1xHS * BxHSxT -> Bx1xT
         # complexity: 1*HS*T
-        wei = q @ self.cache_k.transpose(-2, -1) * C ** -0.5  # (B, T_q, T_k)
+        # even though k_full shape is increasing, q size is [B, 1, HS], so it's batched gemv instead of batched gemm
+        wei = q @ k_full.transpose(-2, -1) * (head_size ** -0.5)  # (B, T_q, T_k)
 
-        if cache_was_empty:
-            T_total = self.cache_k.size(1)
-            wei = wei.masked_fill(self.tril[:T, :T_total] == 0, float('-inf'))
+        if T > 1:
+            # max_L = T after we exceed block_size length
+            cur_len = k_full.size(1)
+            mask = self.tril[:cur_len, :cur_len][-T:, :]
+            wei = wei.masked_fill(mask == 0, float('-inf'))
 
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
 
-        # shapes: Bx1xT * BxTxHS -> Bx1xHS
-        # complexity: 1*T*HS
-        out = wei @ self.cache_v
+        # print(f"wei = {wei.shape}, v_full = {v_full.shape}")
+
+        # shapes: Bx1xL * BxLxHS -> Bx1xHS
+        # complexity: 1*L*HS
+        # print(wei.shape)
+        # ditto, v_full shape is increasing [B, L, HS], and wei size is [B, 1, L]. 
+        # actually this matmul is poor optimized? when L = T, we have same complexit as with no cache
+        out = wei @ v_full
 
         # overall complexity with cache: 3*1*C*HS + 2*1*HS*T = O(C*HS) + O(HS*T)
         # overall complexity NO cache  : 3*T*C*HS + 2*T*HS*T = O(T*C*HS) + O(T*HS*T) = T * O(cache)
@@ -221,14 +212,17 @@ class TinyGPTModel(nn.Module):
         self.ln_fin = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.use_cache = use_cache
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, pos_offset = 0):
         B, T = idx.shape
+        device = idx.device
 
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx)  # (B,T,C)
 
-        pos_emb = self.position_embedding_table(torch.arange(T, device=self.device))  # (T,C)
+        pos_ids = torch.arange(pos_offset, pos_offset + T, device=device) # (T,)
+        pos_emb = self.position_embedding_table(pos_ids)  # (T,C)
         x = tok_emb + pos_emb  # (B,T,C)
         x = self.blocks(x)
         x = self.ln_fin(x)
@@ -248,23 +242,40 @@ class TinyGPTModel(nn.Module):
         for block in self.blocks:
             block.reset_cache()
 
+    @torch.no_grad()
     def generate(self, idx, max_new_tokens):
-        # idx is (B, T) array of indices in the current context
-        for _ in range(max_new_tokens):
-            # crop idx to the last block_size tokens
-            idx_cond = idx[:, -block_size:]
+        self.reset_cache()  # start clean every time
 
-            # get the predictions
-            logits, loss = self(idx_cond)
-            # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
-            # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B, C)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-            # append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-        
-        self.reset_cache()
-        return idx
+        # --- slow path (no cache built into model) ---
+        # If you built the model with use_cache=False, keep your old logic:
+        if not getattr(self, "use_cache", False):
+            for _ in range(max_new_tokens):
+                idx_cond = idx[:, -block_size:]
+                logits, _ = self(idx_cond, pos_offset=0)
+                logits = logits[:, -1, :]
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+            return idx
+        else:
+            # --- fast KV-cache path ---
+            # Prefill (fills caches). Matches your old "crop to block_size then pos starts at 0".
+            idx_cond = idx[:, -block_size:]
+            logits, _ = self(idx_cond, pos_offset=0)
+
+            for _ in range(max_new_tokens):
+                # sample next token from the last position
+                logits_last = logits[:, -1, :]
+                probs = F.softmax(logits_last, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+
+                # append to sequence
+                idx = torch.cat((idx, idx_next), dim=1)
+
+                # decode ONLY the new token (B,1); position is last slot in the cropped window
+                pos = min(idx.size(1) - 1, block_size - 1)
+                logits, _ = self(idx_next, pos_offset=pos)
+
+            self.reset_cache()
+            return idx
 

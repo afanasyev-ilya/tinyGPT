@@ -100,7 +100,7 @@ def main():
     parser.add_argument('--train', action='store_true', help="Train the model.")
     parser.add_argument('--iters', type=int, default=default_max_iters, help="Number of training iterations (default: 5000).")
     parser.add_argument('--kv', action='store_true', help="Use kv-cache.")
-    parser.add_argument('--tokens', type=int, default=200, help="How much output tokens to generate, default 200.")
+    parser.add_argument('--tokens', type=int, default=(block_size-1), help="How much output tokens to generate, default 200.")
     args = parser.parse_args()
 
     print("Using ", device)
@@ -150,7 +150,7 @@ def main():
     # generate from the model
     model.eval()
 
-    user_prompt = encode("This is new variation of poem, he said")
+    user_prompt = encode("")
     user_context = torch.LongTensor(user_prompt).to(device)
     user_context = torch.unsqueeze(user_context, 0)
 
@@ -167,10 +167,15 @@ def main():
 
     print("---------------- HEAT done ------------------ \n")
 
+    if device == "cuda":
+        torch.cuda.synchronize()
+
     start_time = time.time()
     # Only measure the generation step; do not include decode()
     with nvtx.annotate("sh_infer"):
         tokens = model.generate(user_context, max_new_tokens=args.tokens)[0].tolist()
+    if device == "cuda":
+        torch.cuda.synchronize()
     end_time = time.time()
 
     print(decode(tokens))
