@@ -105,6 +105,7 @@ def main():
     parser.add_argument('--kv', action='store_true', help="Use kv-cache.")
     parser.add_argument('--tokens', type=int, default=(block_size-1), help="How many output tokens to generate.")
     parser.add_argument('--bf16', action='store_true', help="Use bf16 autocast on CUDA (Ampere+).")
+    parser.add_argument('--batch_size', type=int, default=1, help="Batch size for generation (default 1")
     args = parser.parse_args()
 
     print("Using", device)
@@ -157,13 +158,14 @@ def main():
             print("Error: Model was created from scratch and not trained.")
             exit(1)
 
+    model = torch.compile(model, mode="reduce-overhead")
     model.eval()
 
     user_prompt = encode("")
     user_context = torch.LongTensor(user_prompt).to(device)
     user_context = torch.unsqueeze(user_context, 0)
 
-    empty_context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    empty_context = torch.zeros((args.batch_size, 1), dtype=torch.long, device=device)
     user_context = empty_context
 
     autocast_ctx = make_autocast_ctx(amp_dtype)
@@ -186,9 +188,9 @@ def main():
     if device == "cuda":
         torch.cuda.synchronize()
     start_time = time.time()
-    with nvtx.annotate("sh_infer"):
-        with autocast_ctx:
-            tokens = model.generate(user_context, max_new_tokens=args.tokens)[0].tolist()
+    torch.cuda.nvtx.range_push("sh_infer")
+    tokens = model.generate(user_context, max_new_tokens=args.tokens)[0].tolist()
+    torch.cuda.nvtx.range_pop()
     if device == "cuda":
         torch.cuda.synchronize()
     end_time = time.time()
