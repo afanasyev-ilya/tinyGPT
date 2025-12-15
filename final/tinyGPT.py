@@ -278,4 +278,3 @@ class TinyGPTModel(nn.Module):
 
             self.reset_cache()
             return idx
-
