@@ -1,5 +1,6 @@
 from tinyGPT import TinyGPTModel
 from tinyGPT import block_size, batch_size
+from optTinyGPT import OptTinyGPTModel
 import torch
 import torch.nn as nn
 import argparse
@@ -102,10 +103,11 @@ def main():
     parser.add_argument('--load', type=str, help="Path to a saved model to load.")
     parser.add_argument('--train', action='store_true', help="Train the model.")
     parser.add_argument('--iters', type=int, default=default_max_iters, help="Number of training iterations.")
-    parser.add_argument('--kv', action='store_true', help="Use kv-cache.")
+    parser.add_argument('--kv', action='store_true', default=False, help="Use kv-cache.")
     parser.add_argument('--tokens', type=int, default=(block_size-1), help="How many output tokens to generate.")
     parser.add_argument('--bf16', action='store_true', help="Use bf16 autocast on CUDA (Ampere+).")
     parser.add_argument('--batch_size', type=int, default=1, help="Batch size for generation (default 1")
+    parser.add_argument('--opt', action='store_true', default=False, help="Use optimized model (rope, flash attention, fuse).")
     args = parser.parse_args()
 
     print("Using", device)
@@ -132,7 +134,12 @@ def main():
     if args.train:
         use_cache = False  # safest: don't train with kv-cache
 
-    model = TinyGPTModel(vocab_size, use_cache)
+    if args.opt:
+        print("Using optimized model")
+        model = OptTinyGPTModel(vocab_size, use_cache)
+    else:
+        rint("Using simple model")
+        model = TinyGPTModel(vocab_size, use_cache)
     if args.load:
         if os.path.exists(args.load):
             print(f"Loading model from {args.load}...")

@@ -1,179 +1,169 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn import functional as F
 
-# hyperparameters (keep yours)
-batch_size = 64
-block_size = 256
+
+# hyperparameters
+batch_size = 64 # how many independent sequences will we process in parallel?
+block_size = 256 # what is the maximum context length for predictions?
 n_embd = 384
 n_blocks = 6
 n_heads = 6
 dropout = 0.2
+# ------------
 
-
-# ---------------- RoPE helpers ----------------
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, base: float = 10000.0):
+class Head(nn.Module):
+    def __init__(self, head_size, head_idx, block_idx, use_cache=True):
+        """
+        Args:
+            head_size: dimension for the keys, queries, and values.
+            use_cache: if True, use the KV cache variant.
+        """
         super().__init__()
-        if dim % 2 != 0:
-            raise ValueError(f"RoPE head_dim must be even, got {dim}")
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    @torch.no_grad()
-    def cos_sin(self, positions: torch.Tensor, device, dtype):
-        # positions: (T,)
-        freqs = torch.einsum("t,d->td", positions.to(device=device, dtype=self.inv_freq.dtype), self.inv_freq)  # (T, D/2)
-        return freqs.cos().to(dtype=dtype), freqs.sin().to(dtype=dtype)
-
-
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """
-    x:   (B, H, T, D)
-    cos: (T, D/2)
-    sin: (T, D/2)
-    RoPE with even/odd interleaving (LLaMA/NeoX-style).
-    """
-    # split even/odd
-    x_even = x[..., 0::2]  # (B,H,T,D/2)
-    x_odd  = x[..., 1::2]  # (B,H,T,D/2)
-
-    cos = cos[None, None, :, :]  # (1,1,T,D/2)
-    sin = sin[None, None, :, :]
-
-    out_even = x_even * cos - x_odd * sin
-    out_odd  = x_even * sin + x_odd * cos
-
-    out = torch.empty_like(x)
-    out[..., 0::2] = out_even
-    out[..., 1::2] = out_odd
-    return out
-
-
-# ---------------- Fused QKV + Flash (SDPA) + KV cache ----------------
-class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads: int, n_embd: int, use_cache: bool):
-        super().__init__()
-        assert n_embd % num_heads == 0
-        self.num_heads = num_heads
-        self.head_dim = n_embd // num_heads
-        self.use_cache = use_cache
-
-        # fused QKV
-        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.proj = nn.Linear(n_embd, n_embd, bias=True)
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        # Lower triangular matrix for causal masking (size: block_size x block_size)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
 
-        self.rope = RotaryEmbedding(self.head_dim)
+        # Flag to turn on/off caching. By default, caching is off.
+        self.use_cache = use_cache
+        # Internal storage for cached keys and values.
+        self.cache_k = None  # shape: (B, T_cached, head_size)
+        self.cache_v = None  # shape: (B, T_cached, head_size)
+        self.head_size = head_size
 
-        # KV cache: (B, H, L, D)
-        self.k_cache = None
-        self.v_cache = None
-        self.cache_index = 0      # how many tokens currently stored
-        self.pos_base = 0         # absolute position of cache index 0 (for sliding window)
-
-    def reset_cache(self):
-        self.k_cache = None
-        self.v_cache = None
+        # use for prints only, to allow debug info only from a single head
+        self.head_idx = head_idx
+        self.block_idx = block_idx
         self.cache_index = 0
-        self.pos_base = 0
 
-    def _maybe_init_cache(self, B, device, dtype):
-        if self.k_cache is None:
-            self.k_cache = torch.empty(B, self.num_heads, block_size, self.head_dim, device=device, dtype=dtype)
-            self.v_cache = torch.empty(B, self.num_heads, block_size, self.head_dim, device=device, dtype=dtype)
-            self.cache_index = 0
-            self.pos_base = 0
+    def forward_no_cache(self, x):
+        B, T, C = x.shape  # C should equal n_embd
+        # B = 1, so we can work with square matricies
 
-    def _slide_if_needed(self, T: int):
-        """
-        Sliding window for KV-cache when exceeding block_size.
-        This is now feasible/correct with RoPE because positions are absolute (pos_base grows).
-        """
-        if self.cache_index + T <= block_size:
-            return
+        # shapes: BxTxC * BxCxHS -> BxTxHS
+        # complexity: T*C*HS
+        k = self.key(x)    # (B, T, head_size)
+        # ditto
+        q = self.query(x)  # (B, T, head_size)
+        # ditto
+        v = self.value(x)  # (B, T, head_size)
 
-        overflow = self.cache_index + T - block_size
-        # keep the last (block_size - T) old tokens, then append T new tokens
-        keep = block_size - T
-        if keep > 0:
-            self.k_cache[:, :, :keep, :] = self.k_cache[:, :, overflow:self.cache_index, :].clone()
-            self.v_cache[:, :, :keep, :] = self.v_cache[:, :, overflow:self.cache_index, :].clone()
-        self.cache_index = max(0, keep)
-        self.pos_base += overflow
+        # Compute scaled dot-product attention scores
+        # shapes: TxHS * HSxT -> TxT
+        # complexity: T * HS * T
+        wei = q @ k.transpose(-2, -1) * (self.head_size ** -0.5) # (B, T, T)
+        
+        # Apply causal mask: each token can only attend to previous tokens (including itself)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
 
-    def forward(self, x: torch.Tensor, pos_offset: int = 0) -> torch.Tensor:
-        """
-        x: (B, T, C)
-        pos_offset: used only when use_cache=False (training/no-cache inference)
-        """
+        # shapes: (T x T) * (T x HS) -> T x HS
+        # complexity: T * HS * T
+        out = wei @ v # (B, T, HS)
+
+        # overall complexity: 3*T*C*HS + 2*T*HS*T
+        return out
+
+    def forward_with_cache(self, x): # x is [B, T=1, n_embd]
         B, T, C = x.shape
+        head_size = self.head_size
         device = x.device
         dtype = x.dtype
 
-        qkv = self.qkv(x)  # (B, T, 3C)
-        qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, T, D)
+        # init cache
+        if self.cache_k is None:
+            self.cache_k = torch.empty(B, block_size, head_size, device=device, dtype=dtype)
+            self.cache_v = torch.empty(B, block_size, head_size, device=device, dtype=dtype)
+            self.cache_index = 0
 
+        # T = 1 for decode (KV cache case)
+        k = self.key(x)    # (B, T=1, head_size)
+        q = self.query(x)  # (B, T=1, head_size)
+        v = self.value(x)  # (B, T=1, head_size)
+
+        # use sliding window, but hard with current pos embed
+        #if self.cache_index + T > block_size:
+        #    print("out of windows")
+        #    exit(1)
+
+        self.cache_k[:, self.cache_index:(self.cache_index + T), :] = k
+        self.cache_v[:, self.cache_index:(self.cache_index + T), :] = v
+        self.cache_index += T
+
+        k_full = self.cache_k[:, :self.cache_index, :]
+        v_full = self.cache_v[:, :self.cache_index, :]
+
+        #print(f"k = {k.shape}, cache_k = {self.cache_k.shape}, k_full = {k_full.shape}")
+        #print(f"q = {q.shape}")
+
+        # Compute attention scores
+        # shapes: Bx1xHS * BxHSxT -> Bx1xT
+        # complexity: 1*HS*T
+        # even though k_full shape is increasing, q size is [B, 1, HS], so it's batched gemv instead of batched gemm
+        wei = q @ k_full.transpose(-2, -1) * (head_size ** -0.5)  # (B, T_q, T_k)
+
+        if T > 1:
+            # max_L = T after we exceed block_size length
+            cur_len = k_full.size(1)
+            mask = self.tril[:cur_len, :cur_len][-T:, :]
+            wei = wei.masked_fill(mask == 0, float('-inf'))
+
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+
+        # print(f"wei = {wei.shape}, v_full = {v_full.shape}")
+
+        # shapes: Bx1xL * BxLxHS -> Bx1xHS
+        # complexity: 1*L*HS
+        # print(wei.shape)
+        # ditto, v_full shape is increasing [B, L, HS], and wei size is [B, 1, L]. 
+        # actually this matmul is poor optimized? when L = T, we have same complexit as with no cache
+        out = wei @ v_full
+
+        # overall complexity with cache: 3*1*C*HS + 2*1*HS*T = O(C*HS) + O(HS*T)
+        # overall complexity NO cache  : 3*T*C*HS + 2*T*HS*T = O(T*C*HS) + O(T*HS*T) = T * O(cache)
+        return out
+
+    def forward(self, x):
         if self.use_cache:
-            self._maybe_init_cache(B, device, dtype)
-            self._slide_if_needed(T)
-
-            start = self.cache_index
-            end = start + T
-
-            # absolute positions for these new tokens
-            positions = torch.arange(self.pos_base + start, self.pos_base + end, device=device)
+            return self.forward_with_cache(x)
         else:
-            # no-cache path (e.g., training): positions come from pos_offset
-            positions = torch.arange(pos_offset, pos_offset + T, device=device)
+            return self.forward_no_cache(x)
 
-        cos, sin = self.rope.cos_sin(positions, device=device, dtype=dtype)
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+    def unique_print(self):
+        return self.head_idx == 0 and self.block_idx == 0
 
-        if self.use_cache:
-            # write K/V to cache
-            self.k_cache[:, :, start:end, :] = k
-            self.v_cache[:, :, start:end, :] = v
-            self.cache_index = end
+    def reset_cache(self):
+        """
+        Resets the internal KV cache.
+        """
+        self.cache_k = None
+        self.cache_v = None
+        self.cache_index = 0
 
-            k_full = self.k_cache[:, :, :self.cache_index, :]  # (B,H,L,D)
-            v_full = self.v_cache[:, :, :self.cache_index, :]
 
-            # Causality handling:
-            # - decode step (T=1): no future keys exist in k_full -> no mask needed
-            # - prefill (T>1): need causal mask w.r.t. the chunk
-            if T == 1:
-                attn_mask = None
-                is_causal = False
-            else:
-                # If this is the very first prefill from empty cache, we can use is_causal=True (Flash-friendly).
-                if start == 0:
-                    attn_mask = None
-                    is_causal = True
-                else:
-                    # General chunked case: build an explicit (T, L) additive mask (may disable flash).
-                    L = k_full.size(2)
-                    qpos = torch.arange(self.pos_base + start, self.pos_base + end, device=device).view(T, 1)  # (T,1)
-                    kpos = torch.arange(self.pos_base, self.pos_base + L, device=device).view(1, L)            # (1,L)
-                    allowed = (kpos <= qpos)  # (T,L)
-                    attn_mask = torch.zeros((T, L), device=device, dtype=dtype)
-                    attn_mask = attn_mask.masked_fill(~allowed, float("-inf"))
-                    is_causal = False
 
-            dropout_p = dropout if self.training else 0.0
-            y = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
-        else:
-            # Training/no-cache: standard causal attention (Flash-friendly)
-            dropout_p = dropout if self.training else 0.0
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True)
+class MultiHeadAttention(nn.Module):
+    """ multiple heads of self-attention in parallel """
+    def __init__(self, num_heads, head_size, block_idx, use_cache):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size, head_idx, block_idx, use_cache) for head_idx in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
-        # (B,H,T,D) -> (B,T,C)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.proj(y)
-        y = self.dropout(y)
-        return y
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        out = self.dropout(out)
+        return out
+    
+    def reset_cache(self):
+        for head in self.heads:
+            head.reset_cache()
 
 
 class FeedFoward(nn.Module):
@@ -192,14 +182,16 @@ class FeedFoward(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, n_embd, block_idx, use_cache, n_head):
+        # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
-        self.sa = MultiHeadAttention(n_head, n_embd, use_cache)
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size, block_idx, use_cache)
         self.ffwd = FeedFoward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x, pos_offset=0):
-        x = x + self.sa(self.ln1(x), pos_offset=pos_offset)
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
         return x
 
@@ -207,60 +199,82 @@ class Block(nn.Module):
         self.sa.reset_cache()
 
 
+# our tiny GPT model
 class TinyGPTModel(nn.Module):
     def __init__(self, vocab_size, use_cache=False):
         super().__init__()
+        # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-
-        self.blocks = nn.ModuleList(
-            [Block(n_embd, block_idx, use_cache, n_head=n_heads) for block_idx in range(n_blocks)]
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(
+            *[Block(n_embd, block_idx, use_cache, n_head=n_heads) for block_idx in range(n_blocks)]
         )
         self.ln_fin = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.use_cache = use_cache
 
-    def forward(self, idx, targets=None, pos_offset=0):
+    def forward(self, idx, targets=None, pos_offset = 0):
         B, T = idx.shape
-        x = self.token_embedding_table(idx)  # (B,T,C)
+        device = idx.device
 
-        # propagate pos_offset (only relevant in no-cache; cache uses internal positions)
-        cur_pos = pos_offset
-        for blk in self.blocks:
-            x = blk(x, pos_offset=cur_pos)
+        # idx and targets are both (B,T) tensor of integers
+        tok_emb = self.token_embedding_table(idx)  # (B,T,C)
+
+        pos_ids = torch.arange(pos_offset, pos_offset + T, device=device) # (T,)
+        pos_emb = self.position_embedding_table(pos_ids)  # (T,C)
+        x = tok_emb + pos_emb  # (B,T,C)
+        x = self.blocks(x)
         x = self.ln_fin(x)
         logits = self.lm_head(x)
 
-        loss = None
-        if targets is not None:
+        if targets is None:
+            loss = None
+        else:
             B, T, C = logits.shape
-            loss = F.cross_entropy(logits.view(B*T, C), targets.view(B*T))
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
+
         return logits, loss
 
     def reset_cache(self):
-        for blk in self.blocks:
-            blk.reset_cache()
+        for block in self.blocks:
+            block.reset_cache()
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens):
-        self.reset_cache()
+        self.reset_cache()  # start clean every time
 
-        if not self.use_cache:
+        # --- slow path (no cache built into model) ---
+        # If you built the model with use_cache=False, keep your old logic:
+        if not getattr(self, "use_cache", False):
             for _ in range(max_new_tokens):
                 idx_cond = idx[:, -block_size:]
                 logits, _ = self(idx_cond, pos_offset=0)
-                probs = F.softmax(logits[:, -1, :], dim=-1)
+                logits = logits[:, -1, :]
+                probs = F.softmax(logits, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1)
                 idx = torch.cat((idx, idx_next), dim=1)
             return idx
+        else:
+            # --- fast KV-cache path ---
+            # Prefill (fills caches). Matches your old "crop to block_size then pos starts at 0".
+            idx_cond = idx[:, -block_size:]
+            logits, _ = self(idx_cond, pos_offset=0)
 
-        # cache path: prefill once, then decode token-by-token
-        idx_cond = idx[:, -block_size:]
-        logits, _ = self(idx_cond, pos_offset=0)
+            for _ in range(max_new_tokens):
+                # sample next token from the last position
+                logits_last = logits[:, -1, :]
+                probs = F.softmax(logits_last, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
 
-        for _ in range(max_new_tokens):
-            probs = F.softmax(logits[:, -1, :], dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-            logits, _ = self(idx_next, pos_offset=0)  # pos handled internally in cache
-        return idx
+                # append to sequence
+                idx = torch.cat((idx, idx_next), dim=1)
 
+                # decode ONLY the new token (B,1); position is last slot in the cropped window
+                pos = min(idx.size(1) - 1, block_size - 1)
+                logits, _ = self(idx_next, pos_offset=pos)
+
+            self.reset_cache()
+            return idx
