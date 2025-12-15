@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 
 # hyperparameters (keep yours)
 batch_size = 64
@@ -173,6 +174,9 @@ class MultiHeadAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.proj(y)
         y = self.dropout(y)
+
+        # overall complexity with cache: 3*1*C*HS + 2*1*HS*T = O(C*HS) + O(HS*T) = O(T)
+        # overall complexity NO cache  : 3*T*C*HS + 2*T*HS*T = O(T*C*HS) + O(T*HS*T) = = O(T^2) = T * O(cache)
         return y
 
 
@@ -244,7 +248,7 @@ class OptTinyGPTModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         self.reset_cache()
 
-        if not self.use_cache:
+        if not self.use_cache: # no KV-cache path
             for _ in range(max_new_tokens):
                 idx_cond = idx[:, -block_size:]
                 logits, _ = self(idx_cond, pos_offset=0)
@@ -252,15 +256,16 @@ class OptTinyGPTModel(nn.Module):
                 idx_next = torch.multinomial(probs, num_samples=1)
                 idx = torch.cat((idx, idx_next), dim=1)
             return idx
+        else: # KV cache path
+            # cache path: prefill once, then decode token-by-token
+            idx_cond = idx[:, -block_size:]
+            logits, _ = self(idx_cond, pos_offset=0)
 
-        # cache path: prefill once, then decode token-by-token
-        idx_cond = idx[:, -block_size:]
-        logits, _ = self(idx_cond, pos_offset=0)
-
-        for _ in range(max_new_tokens):
-            probs = F.softmax(logits[:, -1, :], dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-            logits, _ = self(idx_next, pos_offset=0)  # pos handled internally in cache
-        return idx
+            # decode part
+            for _ in range(max_new_tokens):
+                probs = F.softmax(logits[:, -1, :], dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+                logits, _ = self(idx_next, pos_offset=0)  # pos handled internally in cache
+            return idx
 
