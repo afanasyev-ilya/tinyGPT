@@ -1,5 +1,6 @@
 from tinyGPT import TinyGPTModel
 from tinyGPT import block_size, batch_size
+from linearTinyGPT import TinyGPTLinearAttentionModel
 from optTinyGPT import OptTinyGPTModel
 import torch
 import torch.nn as nn
@@ -108,6 +109,7 @@ def main():
     parser.add_argument('--bf16', action='store_true', help="Use bf16 autocast on CUDA (Ampere+).")
     parser.add_argument('--batch_size', type=int, default=1, help="Batch size for generation (default 1")
     parser.add_argument('--opt', action='store_true', default=False, help="Use optimized model (rope, flash attention, fuse).")
+    parser.add_argument('--linear', action='store_true', default=False, help="Use linear-attention model.")
     args = parser.parse_args()
 
     print("Using", device)
@@ -137,8 +139,11 @@ def main():
     if args.opt:
         print("Using optimized model")
         model = OptTinyGPTModel(vocab_size, use_cache)
+    elif args.linear:
+        print("Using linear-attention model")
+        model = TinyGPTLinearAttentionModel(vocab_size, use_cache)
     else:
-        rint("Using simple model")
+        print("Using simple model")
         model = TinyGPTModel(vocab_size, use_cache)
     if args.load:
         if os.path.exists(args.load):
