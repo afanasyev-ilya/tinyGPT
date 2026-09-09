@@ -74,6 +74,10 @@ class Head(nn.Module):
         self.index_weight = nn.Linear(n_embd, H_index, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+    # Ниже показан только inference-путь DSA. Для обучения сначала получают
+    # dense-модель, затем отдельно учат indexer предсказывать распределение
+    # важных позиций dense attention. После warm-up включают Top-K и продолжают
+    # адаптировать модель и indexer с отдельными loss-функциями.
     def forward(self, x):
         # input of size (batch, time-step, hidden_dim)
         # output of size (batch, time-step, head_size)
