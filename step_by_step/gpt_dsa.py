@@ -94,6 +94,9 @@ class Head(nn.Module):
         index_weights = self.index_weight(x)  # (B, T, H_index)
 
         # Считаем indexer-скоры каждого запроса со всеми ключами.
+        # COMPLEXITY: для каждой из T query-позиций и T key-позиций выполняется
+        # dot product длины index_dim в каждой из H_index голов:
+        # O(T² * H_index * index_dim), если не учитывать размер batch.
         per_head_scores = torch.einsum(
             'bqhd,bld->bqhl',
             index_q,
@@ -113,6 +116,14 @@ class Head(nn.Module):
             k=min(K, T),
             dim=-1,
         ).indices  # (B, T_query, K)
+
+        # Top-K выбирается отдельно для каждой query-строки: у разных queries
+        # могут быть разные наборы key/value-позиций, а не один набор на весь attention.
+        #                    key positions
+        # query 0            ✓
+        # query 1            · ✓
+        # query 2            ✓ · ✓
+        # query 3            · ✓ · ✓
 
         # Собираем настоящие K и V только в выбранных позициях.
         gather_indices = top_indices.unsqueeze(-1).expand(
@@ -136,6 +147,10 @@ class Head(nn.Module):
         # out = wei @ v  # (B, T, head_size)
 
         # Считаем sparse attention только по выбранным K токенам.
+        # COMPLEXITY: каждая из T query-позиций взаимодействует с K выбранными
+        # key/value-позициями: O(T * K * head_dim), где K=2048 в GigaChat 4.0.
+        # Квадратичность основного attention исчезает, но остается в indexer
+        # einsum выше: O(T² * H_index * index_dim).
         wei = (
             q.unsqueeze(2) * selected_k
         ).sum(dim=-1) * self.head_size ** -0.5  # (B, T_query, K)
