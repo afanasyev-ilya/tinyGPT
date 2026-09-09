@@ -72,17 +72,25 @@ class Head(nn.Module):
         # input of size (batch, time-step, hidden_dim)
         # output of size (batch, time-step, head_size)
         B, T, hidden_dim = x.shape
-        k = self.key(x)  # (B, T, head_size)
-        q = self.query(x)  # (B, T, head_size)
-        v = self.value(x)  # (B, T, head_size)
 
         # Q — «что мне сейчас нужно найти?»
         # K — «по каким признакам меня смогут найти другие токены?»
         # V — «какую информацию я передам, если меня выберут?»
-        # В этом учебном коде KV-cache не реализован. В реальном decode старые Q
-        # не пересчитываются: causal mask разрешал им смотреть только в прошлое,
-        # поэтому появление нового токена не может изменить их результаты.
-        # Сохраняются K и V, а Q строится только для новой позиции.
+        k = self.key(x)  # (B, T, head_size)
+        q = self.query(x)  # (B, T, head_size)
+        v = self.value(x)  # (B, T, head_size)
+
+        # В этом учебном коде KV-cache не реализован. В реальном autoregressive
+        # decode T_query=1: проекции считаются только для нового входного токена.
+        # x_new.shape == (B, 1, hidden_dim)
+        # q_new = self.query(x_new)  # (B, 1, head_size)
+        # k_new = self.key(x_new)    # (B, 1, head_size)
+        # v_new = self.value(x_new)  # (B, 1, head_size)
+        # K_cache = torch.cat((K_cache, k_new), dim=1)  # (B, T + 1, head_size)
+        # V_cache = torch.cat((V_cache, v_new), dim=1)  # (B, T + 1, head_size)
+        # Для полного MHA кеш имеет форму (B, H, T + 1, head_size).
+        # Старые Q не пересчитываются и не кешируются: из-за causal mask они
+        # смотрели только в прошлое, поэтому новый токен не меняет их результаты.
         wei = q @ k.transpose(-2, -1) * self.head_size ** -0.5
         # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
 
