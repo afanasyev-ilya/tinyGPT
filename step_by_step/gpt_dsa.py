@@ -65,6 +65,7 @@ def estimate_loss():
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
+        self.head_size = head_size
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
@@ -74,13 +75,13 @@ class Head(nn.Module):
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
-        # input of size (batch, time-step, channels)
-        # output of size (batch, time-step, head size)
-        B, T, C = x.shape
+        # input of size (batch, time-step, hidden_dim)
+        # output of size (batch, time-step, head_size)
+        B, T, hidden_dim = x.shape
 
-        q = self.query(x)  # (B, T, hs)
-        k = self.key(x)  # (B, T, hs)
-        v = self.value(x)  # (B, T, hs)
+        q = self.query(x)  # (B, T, head_size)
+        k = self.key(x)  # (B, T, head_size)
+        v = self.value(x)  # (B, T, head_size)
 
         # Строим отдельные ключи, запросы и веса DSA-indexer.
         index_k = self.index_key(x)  # (B, T, index_dim)
@@ -112,34 +113,34 @@ class Head(nn.Module):
         # Собираем настоящие K и V только в выбранных позициях.
         gather_indices = top_indices.unsqueeze(-1).expand(
             -1, -1, -1, k.size(-1)
-        )  # (B, T_query, K, hs)
+        )  # (B, T_query, K, head_size)
         selected_k = torch.gather(
             k.unsqueeze(1).expand(-1, T, -1, -1),
             dim=2,
             index=gather_indices,
-        )  # (B, T_query, K, hs)
+        )  # (B, T_query, K, head_size)
         selected_v = torch.gather(
             v.unsqueeze(1).expand(-1, T, -1, -1),
             dim=2,
             index=gather_indices,
-        )  # (B, T_query, K, hs)
+        )  # (B, T_query, K, head_size)
 
         # Было: dense attention считал скоры и агрегацию по всем T токенам.
-        # wei = q @ k.transpose(-2, -1) * C ** -0.5  # (B, T, T)
+        # wei = q @ k.transpose(-2, -1) * self.head_size ** -0.5  # (B, T, T)
         # wei = wei.masked_fill(self.tril[0:T, 0:T] == 0, float('-inf'))
         # wei = F.softmax(wei, dim=-1)  # (B, T, T)
-        # out = wei @ v  # (B, T, hs)
+        # out = wei @ v  # (B, T, head_size)
 
         # Считаем sparse attention только по выбранным K токенам.
         wei = (
             q.unsqueeze(2) * selected_k
-        ).sum(dim=-1) * C ** -0.5  # (B, T_query, K)
+        ).sum(dim=-1) * self.head_size ** -0.5  # (B, T_query, K)
         selected_is_future = top_indices > torch.arange(T, device=x.device).view(1, T, 1)
         wei = wei.masked_fill(selected_is_future, float('-inf'))  # (B, T_query, K)
         wei = F.softmax(wei, dim=-1)  # (B, T_query, K)
         out = (
             wei.unsqueeze(-1) * selected_v
-        ).sum(dim=2)  # (B, T_query, hs)
+        ).sum(dim=2)  # (B, T_query, head_size)
         return out
 
 
@@ -168,17 +169,17 @@ class BigramLanguageModel(nn.Module):
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.token_embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T,C)
-        x = tok_emb + pos_emb  # (B,T,C)
+        tok_emb = self.token_embedding_table(idx)  # (B, T, hidden_dim)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, hidden_dim)
+        x = tok_emb + pos_emb  # (B, T, hidden_dim)
         x = self.sa_heads(x)
         logits = self.lm_head(x)
 
         if targets is None:
             loss = None
         else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
+            B, T, vocab_size_current = logits.shape
+            logits = logits.view(B*T, vocab_size_current)
             targets = targets.view(B*T)
             loss = F.cross_entropy(logits, targets)
 
@@ -193,9 +194,9 @@ class BigramLanguageModel(nn.Module):
             # get the predictions
             logits, loss = self(idx_cond)
             # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
+            logits = logits[:, -1, :] # becomes (B, vocab_size)
             # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B, C)
+            probs = F.softmax(logits, dim=-1) # (B, vocab_size)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
             # append sampled index to the running sequence

@@ -62,24 +62,41 @@ def estimate_loss():
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
+        self.head_size = head_size
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
-        # input of size (batch, time-step, channels)
-        # output of size (batch, time-step, head size)
-        B, T, C = x.shape
-        k = self.key(x)  # (B,T,hs)
-        q = self.query(x)  # (B,T,hs)
-        # compute attention scores ("affinities")
-        wei = q @ k.transpose(-2, -1) * C ** -0.5  # (B, T, hs) @ (B, hs, T) -> (B, T, T)
+        # input of size (batch, time-step, hidden_dim)
+        # output of size (batch, time-step, head_size)
+        B, T, hidden_dim = x.shape
+        k = self.key(x)  # (B, T, head_size)
+        q = self.query(x)  # (B, T, head_size)
+        v = self.value(x)  # (B, T, head_size)
+
+        # Q и K определяют, насколько каждый токен заинтересован в каждом другом
+        # токене; V хранит данные токена, которые затем попадут в результат.
+        wei = q @ k.transpose(-2, -1) * self.head_size ** -0.5
+        # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
+
+        # Запрещаем смотреть в будущее. Например, для трех токенов:
+        # [[score_00,      -inf,      -inf],
+        #  [score_10,  score_11,      -inf],
+        #  [score_20,  score_21,  score_22]]
         wei = wei.masked_fill(self.tril[0:T, 0:T] == 0, float('-inf'))  # (B, T, T)
+
+        # Softmax нормирует каждую строку: разрешенные веса неотрицательны и в
+        # сумме дают 1, а позиции в будущем получают вес 0.
         wei = F.softmax(wei, dim=-1)  # (B, T, T)
-        # perform the weighted aggregation of the values
-        v = self.value(x)  # (B,T,hs)
-        out = wei @ v  # (B, T, T) @ (B, T, hs) -> (B, T, hs)
+        # [[1,          0,          0],
+        #  [weight_10,  weight_11,  0],
+        #  [weight_20,  weight_21,  weight_22]]
+
+        # Для каждого токена смешиваем V-векторы доступных токенов с этими весами.
+        out = wei @ v
+        # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
         return out
 
 
@@ -108,17 +125,17 @@ class BigramLanguageModel(nn.Module):
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.token_embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T,C)
-        x = tok_emb + pos_emb  # (B,T,C)
+        tok_emb = self.token_embedding_table(idx)  # (B, T, hidden_dim)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, hidden_dim)
+        x = tok_emb + pos_emb  # (B, T, hidden_dim)
         x = self.sa_heads(x)
         logits = self.lm_head(x)
 
         if targets is None:
             loss = None
         else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
+            B, T, vocab_size_current = logits.shape
+            logits = logits.view(B*T, vocab_size_current)
             targets = targets.view(B*T)
             loss = F.cross_entropy(logits, targets)
 
@@ -133,9 +150,9 @@ class BigramLanguageModel(nn.Module):
             # get the predictions
             logits, loss = self(idx_cond)
             # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
+            logits = logits[:, -1, :] # becomes (B, vocab_size)
             # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B, C)
+            probs = F.softmax(logits, dim=-1) # (B, vocab_size)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
             # append sampled index to the running sequence
