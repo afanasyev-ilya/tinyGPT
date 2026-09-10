@@ -49,3 +49,19 @@ Generation took 23.7522 seconds
 python3 ./shakespeare.py --load ./tinygpt_model.pt --tokens 255 --bf16 --batch_size 128 --opt --kv
 Generation took 1.8248 seconds
 ```
+
+### advanced optimizations
+
+Small, self-contained implementations live in `advanced_optimizations/`.
+
+The Gated DeltaNet path starts from the same Q/K/V operations as
+`gpt_mha.py`, derives recurrent linear attention, and then adds Delta Rule,
+alpha decay and beta write strength:
+
+```bash
+python3 advanced_optimizations/gdn/linear_attention.py
+python3 advanced_optimizations/gdn/gdn.py
+```
+
+Open `advanced_optimizations/gdn/gdn_explained.html` for the illustrated
+prefill/decode walkthrough and the mapping to GigaChat/TensorRT-LLM.
