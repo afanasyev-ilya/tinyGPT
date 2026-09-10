@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GDN: от hidden state до следующего токена</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f3ec;
+      --paper: #fffdf8;
+      --ink: #20231f;
+      --muted: #62675f;
+      --line: #d9d3c5;
+      --accent: #0b766e;
+      --accent-soft: #dcefeb;
+      --code: #192522;
+      --code-ink: #e7f5ef;
+      --warn: #9b5c16;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(920px, calc(100% - 32px));
+      margin: 32px auto 72px;
+      padding: clamp(24px, 5vw, 64px);
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      box-shadow: 0 16px 48px rgba(42, 35, 23, .08);
+    }
+    h1, h2, h3 { line-height: 1.18; letter-spacing: -.025em; }
+    h1 { font-size: clamp(36px, 6vw, 62px); margin: 0 0 16px; }
+    h2 { font-size: 30px; margin: 56px 0 18px; }
+    h3 { font-size: 21px; margin: 32px 0 12px; }
+    p { margin: 12px 0; }
+    .lead { font-size: 21px; color: var(--muted); max-width: 740px; }
+    .pill {
+      display: inline-block;
+      padding: 5px 11px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+    .callout {
+      margin: 24px 0;
+      padding: 18px 20px;
+      border-left: 5px solid var(--accent);
+      border-radius: 8px;
+      background: var(--accent-soft);
+    }
+    .warning { border-color: var(--warn); }
+    code {
+      padding: .12em .34em;
+      border-radius: 5px;
+      background: color-mix(in srgb, var(--line) 48%, transparent);
+      font: .91em ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    pre {
+      overflow-x: auto;
+      margin: 18px 0;
+      padding: 20px;
+      border-radius: 13px;
+      background: var(--code);
+      color: var(--code-ink);
+      font: 14px/1.62 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    pre code { padding: 0; background: none; color: inherit; }
+    .math {
+      overflow-x: auto;
+      margin: 18px 0;
+      padding: 14px 18px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      font: 18px/1.6 Georgia, "Times New Roman", serif;
+      text-align: center;
+      white-space: nowrap;
+    }
+    table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; }
+    th { color: var(--muted); font-size: 14px; text-transform: uppercase; letter-spacing: .04em; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 9px;
+      align-items: center;
+      margin: 24px 0;
+    }
+    .flow > div {
+      min-height: 92px;
+      display: grid;
+      place-items: center;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      text-align: center;
+      font-size: 14px;
+    }
+    .flow .arrow { min-height: auto; border: 0; padding: 0; font-size: 24px; color: var(--accent); }
+    ul { padding-left: 24px; }
+    a { color: var(--accent); }
+    footer { margin-top: 56px; color: var(--muted); font-size: 14px; }
+    @media (max-width: 700px) {
+      .flow { grid-template-columns: 1fr; }
+      .flow .arrow { transform: rotate(90deg); }
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111614;
+        --paper: #18201d;
+        --ink: #edf2ee;
+        --muted: #acb7b0;
+        --line: #34413c;
+        --accent: #66d2c3;
+        --accent-soft: #183a35;
+        --code: #0d1210;
+        --code-ink: #ddf5ed;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <span class="pill">Исполняемая интуиция</span>
+  <h1>GDN: что такое <i>o</i> и где настоящий цикл</h1>
+  <p class="lead">Путь одного токена: hidden state → Q/K/V → recurrent state → output слоя → logits → следующий token ID. И почему в TensorRT‑LLM trace нет тысячи маленьких matmul.</p>
+
+  <section>
+    <h2>1. Базовый цикл</h2>
+    <p>После токенизации мы имеем IDs формы <code>[B,T]</code>. Embedding превращает каждый ID в hidden-вектор <code>xᵢ</code> длины <code>C</code>. Внутри каждого слоя <code>x</code> уже означает не token ID, а активации этого слоя формы <code>[B,T,C]</code>.</p>
+
+    <pre><code>for i in range(T):
+    q_i = W_q @ x_i       # [d_k]
+    k_i = W_k @ x_i       # [d_k]
+    v_i = W_v @ x_i       # [d_v]
+
+    S_i = S_prev + outer(v_i, k_i)  # [d_v, d_k]
+    o_i = S_i @ q_i                 # [d_v]
+
+    S_prev = S_i</code></pre>
+
+    <table>
+      <thead><tr><th>Объект</th><th>Форма одной головы</th><th>Смысл</th></tr></thead>
+      <tbody>
+        <tr><td><code>xᵢ</code></td><td><code>[C]</code></td><td>Вход текущего слоя</td></tr>
+        <tr><td><code>qᵢ, kᵢ</code></td><td><code>[d_k]</code></td><td>Адрес чтения и адрес записи</td></tr>
+        <tr><td><code>vᵢ</code></td><td><code>[d_v]</code></td><td>Содержимое записи</td></tr>
+        <tr><td><code>Sᵢ</code></td><td><code>[d_v,d_k]</code></td><td>Матрица ассоциативной памяти</td></tr>
+        <tr><td><code>oᵢ</code></td><td><code>[d_v]</code></td><td>Результат чтения из памяти в этом слое</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout"><strong><code>oᵢ</code> — не следующий токен.</strong> Это промежуточный output одного GDN/attention sublayer для позиции <code>i</code>.</div>
+  </section>
+
+  <section>
+    <h2>2. Как из <code>oᵢ</code> получается следующий токен</h2>
+    <p>Outputs голов объединяются, проходят output projection и возвращаются в residual stream:</p>
+    <div class="math">yᵢ = W<sub>o</sub> oᵢ, &nbsp;&nbsp; x′ᵢ = xᵢ + yᵢ</div>
+    <p>После этого идут MLP/MoE и остальные слои. Только hidden state последнего слоя переводится LM head’ом в logits по словарю.</p>
+
+    <div class="flow">
+      <div><code>o₄</code><br>один GDN-слой</div>
+      <div class="arrow">→</div>
+      <div>остальные слои<br><code>h₄ final</code></div>
+      <div class="arrow">→</div>
+      <div>LM head<br><code>logits₄</code><br>→ token 5</div>
+    </div>
+
+    <pre><code>позиция 4: o_4 -> ... -> logits_4 -> выбираем token 5
+позиция 5: o_5 -> ... -> logits_5 -> выбираем token 6
+позиция 6: o_6 -> ... -> logits_6 -> выбираем token 7</code></pre>
+  </section>
+
+  <section>
+    <h2>3. Prefill → decode → decode</h2>
+    <p>Семантически prefill четырёх токенов обязан быть causal: первому output доступен только первый токен, второму — первые два и так далее.</p>
+
+    <pre><code># prefill
+S_0 = zeros(...)
+o_1, S_1 = step(S_0, q_1, k_1, v_1)
+o_2, S_2 = step(S_1, q_2, k_2, v_2)
+o_3, S_3 = step(S_2, q_3, k_3, v_3)
+o_4, S_4 = step(S_3, q_4, k_4, v_4)
+
+# После prefill S_1..S_3 больше не кэшируются; остаётся S_4.
+
+# первый decode
+o_5, S_5 = step(S_4, q_5, k_5, v_5)
+
+# второй decode
+o_6, S_6 = step(S_5, q_6, k_6, v_6)</code></pre>
+
+    <p>Нельзя сначала построить <code>S₄</code>, а потом посчитать <code>o₁=S₄q₁</code>: в <code>o₁</code> протекла бы информация из будущих позиций 2–4. Однако хранить после prefill нужно только конечный <code>S₄</code>.</p>
+
+    <div class="callout warning"><strong>Тонкая поправка:</strong> читать <code>S</code> на каждом шаге нормально. Это матрица фиксированного размера, поэтому цена <code>S @ q</code> не растёт с длиной контекста. Мы избегаем не чтения state, а повторного прохода по всем старым <code>K,V</code> и повторного построения state с нуля.</div>
+  </section>
+
+  <section>
+    <h2>4. Delta rule применяется и в prefill, и в decode</h2>
+    <p>Additive update <code>S += outer(v,k)</code> уже даёт linear-time recurrence и фиксированный cache. Но старые записи никогда не удаляются, нормы state могут расти, а похожие keys складывают конфликтующие values в одни направления. Delta rule решает это не усреднением, а чтением старой записи и записью только ошибки.</p>
+
+    <h3>Короткая версия: главное правило α и β</h3>
+    <div class="callout">
+      <p><strong>α отвечает за старую память целиком.</strong> Сначала весь state умножается на α: при α≈1 почти всё помним, при маленьком α быстро забываем.</p>
+      <p><strong>β отвечает за текущую запись.</strong> После decay модель смотрит, что state уже возвращает для текущего key, и сдвигает это значение к новому <code>v</code>: при β=0 не пишет ничего, при β=1 заменяет запись полностью.</p>
+    </div>
+
+    <pre><code># 1. Состарить всю память
+S = alpha * S
+
+# 2. Узнать, что сейчас записано по текущему key
+old = S @ k
+
+# 3. Приблизить old к новому value; beta задаёт размер шага
+correction = beta * (v - old)
+S = S + outer(correction, k)
+
+# 4. Прочитать output текущей позиции
+o = S @ q</code></pre>
+
+    <p>Если key нормирован и мы после update читаем по тому же key, всё сводится к одной строке:</p>
+    <div class="math">новая запись = (1−β) · α · старая запись + β · новое value.</div>
+
+    <p>Мини-пример: state хранит две независимые записи <code>[10,20]</code>; текущий key указывает на первую, и мы хотим записать туда <code>4</code>.</p>
+    <table>
+      <thead><tr><th>α</th><th>β</th><th>Результат</th><th>По-человечески</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>0</td><td><code>[10,20]</code></td><td>Всё оставить как есть</td></tr>
+        <tr><td>1</td><td>0.5</td><td><code>[7,20]</code></td><td>Пройти половину пути от 10 к 4</td></tr>
+        <tr><td>1</td><td>1</td><td><code>[4,20]</code></td><td>Заменить 10 на 4</td></tr>
+        <tr><td>0.5</td><td>0</td><td><code>[5,10]</code></td><td>Забыть половину всей памяти, ничего не писать</td></tr>
+        <tr><td>0.5</td><td>1</td><td><code>[4,10]</code></td><td>Забыть половину всего, затем точно записать 4</td></tr>
+      </tbody>
+    </table>
+
+    <p><strong>Коротко:</strong> α — «сколько оставить от прошлого», β — «насколько поверить новой записи». Оба коэффициента GigaChat вычисляет заново для каждого токена, GDN-слоя и value-head; это не две константы на всю модель.</p>
+
+    <pre><code>def gated_delta_step(S, q, k, v, alpha, beta):
+    S = alpha * S                  # глобально забываем
+    old_value = S @ k              # что уже записано по адресу k
+    error = beta * (v - old_value) # насколько исправить запись
+    S = S + outer(error, k)        # rank-one update
+    o = S @ q                      # читаем для текущей позиции
+    return o, S</code></pre>
+
+    <p>Именно эта функция <code>step</code> семантически используется для всех четырёх prompt-токенов, затем для token 5, затем для token 6. Delta rule — часть определения GDN, а не специальный режим decode.</p>
+
+    <h3>Что именно делает β</h3>
+    <p>Сначала временно положим <code>α=1</code>. Для нормированного key, то есть <code>kᵀk=1</code>, прочитаем обновлённый state по тому же key:</p>
+    <div class="math">S′k = Sk + β(v − Sk)(kᵀk) = (1−β)Sk + βv.</div>
+    <p>Это точная интерполяция между старым предсказанием <code>Sk</code> и новым target <code>v</code>:</p>
+    <ul>
+      <li><code>β=0</code> — проигнорировать текущую запись;</li>
+      <li><code>β=0.25</code> — пройти четверть пути от старого value к новому;</li>
+      <li><code>β=1</code> — полностью заменить value для направления <code>k</code>.</li>
+    </ul>
+    <p>Для любого направления <code>u</code>, ортогонального текущему key (<code>kᵀu=0</code>), delta update ничего не меняет:</p>
+    <div class="math">S′u = Su + β(v−Sk)kᵀu = Su.</div>
+    <p>Поэтому β — это одновременно learning rate fast-weight памяти и сила точечной перезаписи.</p>
+
+    <h3>Что именно делает α</h3>
+    <p>Перед delta update GDN умножает весь state на <code>α∈(0,1)</code>:</p>
+    <div class="math">S̄ = αS, &nbsp;&nbsp; S′ = S̄ + β(v−S̄k)kᵀ.</div>
+    <p>Для нормированного текущего key:</p>
+    <div class="math">S′k = (1−β)α(Sk) + βv.</div>
+    <p>А для ортогонального направления <code>u</code>:</p>
+    <div class="math">S′u = αSu.</div>
+    <p>То есть delta/β может восстановить или заменить текущую ассоциацию, а все нетронутые направления просто стареют с коэффициентом α.</p>
+
+    <h3>Численный пример</h3>
+    <p>Пусть state одной value-размерности равен <code>S=[10,20]</code>, текущий <code>k=[1,0]</code>, а новое <code>v=4</code>. Второй элемент state соответствует ортогональному направлению и текущей записью не затрагивается.</p>
+    <table>
+      <thead><tr><th>α</th><th>β</th><th>Новый state</th><th>Что произошло</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>0</td><td><code>[10,20]</code></td><td>Новую запись проигнорировали</td></tr>
+        <tr><td>1</td><td>0.25</td><td><code>[8.5,20]</code></td><td>25% пути от 10 к 4</td></tr>
+        <tr><td>1</td><td>1</td><td><code>[4,20]</code></td><td>Точно заменили первую ассоциацию</td></tr>
+        <tr><td>0.5</td><td>0</td><td><code>[5,10]</code></td><td>Только глобальное затухание</td></tr>
+        <tr><td>0.5</td><td>0.25</td><td><code>[4.75,10]</code></td><td>Decay, затем частичная запись 4</td></tr>
+        <tr><td>0.5</td><td>1</td><td><code>[4,10]</code></td><td>Первую запись восстановили до 4, вторая затухла</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Как модель выбирает α и β</h3>
+    <p>В TRT‑LLM/GigaChat это data-dependent величины для каждого токена и головы. Из дополнительных projections <code>aᵢ,bᵢ</code> вычисляется:</p>
+    <div class="math">gᵢ = −exp(A<sub>log</sub>) softplus(aᵢ + dt<sub>bias</sub>), &nbsp;&nbsp; αᵢ=exp(gᵢ), &nbsp;&nbsp; βᵢ=sigmoid(bᵢ).</div>
+    <ul>
+      <li>Большой положительный <code>aᵢ+dt_bias</code> делает α меньше: сильнее очистить старую память.</li>
+      <li>Сильно отрицательный <code>aᵢ+dt_bias</code> даёт α около 1: сохранить память.</li>
+      <li>Большой <code>bᵢ</code> даёт β около 1: активно записать/заменить.</li>
+      <li>Сильно отрицательный <code>bᵢ</code> даёт β около 0: почти не учиться на этом токене.</li>
+    </ul>
+    <p><code>A_log</code> и <code>dt_bias</code> задают базовый timescale головы, а projections <code>aᵢ,bᵢ</code> позволяют менять forget/write behavior в зависимости от содержимого токена.</p>
+
+    <h3>Как затухает старая запись во времени</h3>
+    <p>Если некоторое направление долго не получает корректирующих delta-записей, его вклад между позициями <code>j</code> и <code>t</code> умножается на произведение gates:</p>
+    <div class="math">memory from j at t ∝ α<sub>j+1</sub> α<sub>j+2</sub> … α<sub>t</sub>.</div>
+    <p>При постоянном α старая информация убывает экспоненциально. Например, примерный half-life равен <code>log(0.5)/log(α)</code>: для α=0.9 это около 6.6 токена, для 0.99 — 69, для 0.999 — 693. В настоящем GDN α меняется на каждом токене, поэтому модель сама выбирает, когда удерживать state, а когда быстро его стереть.</p>
+  </section>
+
+  <section>
+    <h2>5. Есть ли такой цикл в реальном TensorRT‑LLM?</h2>
+    <p><strong>Как математическая зависимость — да. Как последовательность маленьких PyTorch matmul/kernel launches в prefill — нет.</strong></p>
+
+    <h3>Почему recurrence можно перегруппировать</h3>
+    <p>Один GDN step можно записать как аффинное преобразование state:</p>
+    <div class="math">Sᵢ = Sᵢ₋₁ Pᵢ + Hᵢ</div>
+    <p>где</p>
+    <div class="math">Pᵢ = αᵢ(I − βᵢkᵢkᵢᵀ), &nbsp;&nbsp; Hᵢ = βᵢvᵢkᵢᵀ.</div>
+    <p>Подставляем первый шаг во второй и раскрываем скобки:</p>
+    <div class="math">S₁ = S₀P₁ + H₁.</div>
+    <div class="math">S₂ = S₁P₂ + H₂ = (S₀P₁+H₁)P₂+H₂ = S₀P₁P₂+H₁P₂+H₂.</div>
+    <p>Продолжаем подстановку:</p>
+    <div class="math">S₃ = S₀P₁P₂P₃ + H₁P₂P₃ + H₂P₃ + H₃.</div>
+    <div class="math">S₄ = S₀P₁P₂P₃P₄ + H₁P₂P₃P₄ + H₂P₃P₄ + H₃P₄ + H₄.</div>
+    <p>И для chunk из 64 токенов:</p>
+    <div class="math">S₆₄ = S₀(P₁…P₆₄) + Σᵢ₌₁⁶⁴ Hᵢ(Pᵢ₊₁…P₆₄).</div>
+    <p>Весь chunk можно концептуально свернуть в одну пару:</p>
+    <div class="math">P<sub>chunk</sub>=P₁…P₆₄, &nbsp;&nbsp; S₆₄=S₀P<sub>chunk</sub>+H<sub>chunk</sub>.</div>
+    <div class="callout"><strong>Именно так нужно понимать «TRT‑LLM разворачивает до S₆₄».</strong> Результат математически эквивалентен этому раскрытию, но runtime не создаёт 64 полные матрицы <code>Pᵢ</code> и не строит огромную формулу буквально.</div>
+    <p>Каждый <code>Pᵢ</code> имеет специальный вид <code>αᵢ(I−βᵢkᵢkᵢᵀ)</code>: изменение относительно identity является rank-one. TRT‑LLM/FLA использует эту структуру и более экономичное WY-представление, чтобы не материализовать полные <code>Pᵢ</code>, а превратить работу в GPU-friendly matrix multiplies и triangular solve.</p>
+    <p>Кроме конечного <code>S₆₄</code>, prefill обязан получить causal outputs <code>oᵢ=Sᵢqᵢ</code> для всех позиций. Поэтому chunk algorithm вычисляет также эквиваленты prefix-переходов <code>1</code>, <code>1…2</code>, …, <code>1…64</code>. В persistent cache после chunk остаётся только его конечный state.</p>
+
+    <h3>Что происходит в prefill trace</h3>
+    <p>В текущем TRT‑LLM путь <code>chunk_gated_delta_rule</code> разбивает работу примерно на такие стадии:</p>
+    <ol>
+      <li>cumulative log-gate внутри chunk;</li>
+      <li>chunk-local взаимодействия <code>K Kᵀ</code>;</li>
+      <li>triangular solve;</li>
+      <li>построение WY/update-представления;</li>
+      <li>обновление state и вычисление outputs крупными tiled kernels.</li>
+    </ol>
+    <p>Поэтому в Nsight/CUDA trace видны несколько сравнительно крупных kernels на chunk/stage, а не <code>T</code> запусков вида «матрица × вектор». При четырёх токенах весь prompt помещается в один chunk. При длинном prompt chunks обрабатываются с передачей граничного state между ними.</p>
+
+    <h3>Что происходит в decode trace</h3>
+    <p>При обычном decode <code>T=1</code>. Fused recurrent kernel за один launch:</p>
+    <pre><code>загружает S из request state pool
+вычисляет alpha и beta
+нормализует q/k
+делает decay + delta update + read
+записывает новый S обратно</code></pre>
+    <p>Даже если внутри kernel есть цикл по небольшому <code>T</code> (например, verify нескольких draft tokens), это device-side loop внутри одного kernel, а не цепочка видимых снаружи маленьких matmul.</p>
+
+    <table>
+      <thead><tr><th>Режим</th><th>Семантика</th><th>Реализация</th><th>Что видно в trace</th></tr></thead>
+      <tbody>
+        <tr><td>Prefill</td><td><code>S₀→S₁→…→S_T</code></td><td>Chunkwise/WY</td><td>Несколько tiled kernels по стадиям</td></tr>
+        <tr><td>Decode</td><td>Один <code>step(S,q,k,v)</code></td><td>Fused recurrent</td><td>Один основной fused kernel</td></tr>
+        <tr><td>MTP verify</td><td>Несколько коротких steps</td><td>Fused/device loop или replay</td><td>Один/несколько fused kernels, не T GEMV launches</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>6. Как это сочетается в GigaChat</h2>
+    <p>Каждый слой владеет собственным cache. GDN не сжимает KV cache соседнего attention-слоя:</p>
+    <pre><code>GDN layer 0       хранит S^(0) + короткий conv state
+GDN layer 1       хранит S^(1) + короткий conv state
+Attention layer 2 хранит свой растущий KV cache
+GDN layer 3       хранит S^(3) + короткий conv state</code></pre>
+    <p>Текущий token hidden state последовательно проходит эти слои. Attention-слой дописывает свои K/V; GDN-слой поглощает свои текущие k/v в собственный фиксированный state.</p>
+  </section>
+
+  <footer>
+    Код рядом с этой страницей: базовая recurrence — <code>linear_attention.py</code>,
+    версия с затуханием и delta rule — <code>gdn.py</code>.
+  </footer>
+</main>
+</body>
+</html>
