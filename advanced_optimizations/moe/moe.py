@@ -26,7 +26,7 @@ bias_update_speed = 1e-3    # gamma: шаг подстройки bias для б�
 torch.manual_seed(1337)
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-with open('../input.txt', 'r', encoding='utf-8') as f:
+with open('../../input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 # here are all the unique characters that occur in this text
@@ -108,7 +108,7 @@ class MultiHeadAttention(nn.Module):
 # ============================================================================
 #
 # В обычном трансформере после attention стоит FeedForward (см.
-# gpt_mha_ff_head_mix_plus_layernorm.py):
+# ../mha/mha_ff_head_mix_plus_layernorm.py):
 #     x = x + ffwd(ln2(x)),   ffwd: Linear(C, 4C) -> ReLU -> Linear(4C, C)
 #
 # В MoE вместо одного FeedForward стоит много маленьких FeedForward
@@ -317,7 +317,7 @@ class Block(nn.Module):
     def __init__(self, n_embd, n_head):
         super().__init__()
         head_size = n_embd // n_head
-        # БЫЛО в gpt_mha.py: self.sa_heads = MultiHeadAttention(4, n_embd // 4)
+        # БЫЛО в mha_base.py: self.sa_heads = MultiHeadAttention(4, n_embd // 4)
         self.sa = MultiHeadAttention(n_head, head_size)
         # СТАЛО: после attention стоит MoE (вместо FeedForward).
         self.moe = MoE(n_embd, n_experts, top_k, expert_hidden, routed_scaling_factor)
@@ -340,7 +340,7 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        # БЫЛО в gpt_mha.py: self.sa_heads = MultiHeadAttention(4, n_embd // 4)
+        # БЫЛО в mha_base.py: self.sa_heads = MultiHeadAttention(4, n_embd // 4)
         # СТАЛО: один Block = attention + MoE.
         self.block = Block(n_embd, n_head=4)
         self.lm_head = nn.Linear(n_embd, vocab_size)

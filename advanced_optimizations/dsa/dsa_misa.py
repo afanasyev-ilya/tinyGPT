@@ -70,7 +70,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
 
-        # Это тот же обученный DSA-indexer, что и в gpt_dsa.py. MISA не
+        # Это тот же обученный DSA-indexer, что и в dsa.py. MISA не
         # добавляет новых обучаемых projections: она только решает, какие
         # H_index query-головы запускать по полной token-level истории.
         self.index_key = nn.Linear(n_embd, index_dim, bias=False)

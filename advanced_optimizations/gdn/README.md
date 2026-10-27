@@ -2,7 +2,7 @@
 
 Read and run the files in this order:
 
-1. `../gpt_mha.py` — regular softmax attention and its growing KV history.
+1. `../mha_base.py` — regular softmax attention and its growing KV history.
 2. `linear_attention.py` — removes softmax, proves that quadratic causal
    attention can be reassociated into recurrent `S @ q`, and demonstrates
    `prefill(4) + decode(1) + decode(1)`.

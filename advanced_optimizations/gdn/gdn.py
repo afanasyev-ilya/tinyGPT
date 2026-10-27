@@ -106,7 +106,7 @@ def gated_delta_recurrent(
 
 
 class GatedDeltaHead(nn.Module):
-    """Одна учебная GDN-голова — аналог Head из gpt_mha.py."""
+    """Одна учебная GDN-голова — аналог Head из mha_base.py."""
 
     def __init__(self, hidden_dim, head_dim):
         super().__init__()

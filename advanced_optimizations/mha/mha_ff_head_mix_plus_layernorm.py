@@ -16,7 +16,7 @@ n_embd = 32
 torch.manual_seed(1337)
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-with open('../input.txt', 'r', encoding='utf-8') as f:
+with open('../../input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 # here are all the unique characters that occur in this text
@@ -69,7 +69,7 @@ class Head(nn.Module):
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
-        # Этот Head намеренно совпадает с gpt_mha.py: новые основы начинаются
+        # Этот Head намеренно совпадает с mha_base.py: новые основы начинаются
         # ниже, в MultiHeadAttention, FeedForward и Block.
         B, T, hidden_dim = x.shape
 
@@ -98,7 +98,7 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
 
-        # БЫЛО в gpt_mha.py:
+        # БЫЛО в mha_base.py:
         #   out = torch.cat([h(x) for h in self.heads], dim=-1)
         #   return out
         # Каждая голова занимала собственный кусок hidden-вектора.
@@ -146,7 +146,7 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        # БЫЛО в gpt_mha.py: x = self.sa_heads(x)
+        # БЫЛО в mha_base.py: x = self.sa_heads(x)
         # Attention полностью заменял старый x своим output.
 
         # СТАЛО: x идёт и через attention, и по короткому residual-пути.
@@ -165,7 +165,7 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
 
-        # БЫЛО в gpt_mha.py: одна MultiHeadAttention без FFN/residual/LayerNorm.
+        # БЫЛО в mha_base.py: одна MultiHeadAttention без FFN/residual/LayerNorm.
         # self.sa_heads = MultiHeadAttention(4, n_embd // 4)
 
         # СТАЛО: несколько полных Transformer blocks и финальный LayerNorm.

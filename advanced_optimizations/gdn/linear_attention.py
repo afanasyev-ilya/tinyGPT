@@ -1,4 +1,4 @@
-"""Переход от attention из gpt_mha.py к рекуррентной linear attention.
+"""Переход от attention из mha_base.py к рекуррентной linear attention.
 
 Этот файл намеренно останавливается до Delta Rule, alpha и beta. Здесь показан
 ровно один переход: после удаления softmax растущую KV-историю можно свернуть
@@ -8,7 +8,7 @@
     wei = softmax(q @ k.T)
     out = wei @ v
 
-В gpt_mha.py тензор x имеет форму (B, T, hidden_dim), а после projections
+В mha_base.py тензор x имеет форму (B, T, hidden_dim), а после projections
 q, k, v имеют форму (B, T, head_dim). Ось T — это позиции разных токенов:
     q[:, 0] — query первого токена
     q[:, 1] — query второго токена
@@ -43,7 +43,7 @@ def quadratic_attention_without_softmax(q, k, v, scale):
     """
     _, T, _ = q.shape
 
-    # Было в gpt_mha.py перед softmax:
+    # Было в mha_base.py перед softmax:
     # (B, T, K) @ (B, K, T) -> (B, T, T).
     scores = q @ k.transpose(-2, -1) * scale
 

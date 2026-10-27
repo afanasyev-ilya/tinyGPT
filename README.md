@@ -3,7 +3,7 @@
 ### train model
 
 ```
-cd final
+cd tinyGPT_train
 python3 ./shakespeare.py --train
 ```
 
@@ -53,9 +53,27 @@ Generation took 1.8248 seconds
 ### advanced optimizations
 
 Small, self-contained implementations live in `advanced_optimizations/`.
+`advanced_optimizations/README.md` describes the underlying LLM operations
+(math, shapes, toy examples) for DeepSeek and GigaChat.
+
+```
+advanced_optimizations/
+  mha_base.py   base model: multi-head attention, everything else starts from it
+  README.md     LLM operations reference
+  mha/          bigram, single-head and MHA + FFN + LayerNorm variants
+  dsa/          DeepSeek Sparse Attention (DSA indexer, MISA)
+  moe/          Mixture of Experts: sigmoid router, top-k, shared expert
+  gdn/          Gated DeltaNet / linear attention
+```
+
+Run the scripts from their own folder (they read `input.txt` by a relative path):
+
+```bash
+cd advanced_optimizations/moe && python3 moe.py
+```
 
 The Gated DeltaNet path starts from the same Q/K/V operations as
-`gpt_mha.py`, derives recurrent linear attention, and then adds Delta Rule,
+`mha_base.py`, derives recurrent linear attention, and then adds Delta Rule,
 alpha decay and beta write strength:
 
 ```bash
