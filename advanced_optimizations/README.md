@@ -68,7 +68,7 @@
 Базовая связка — **MLA + FFN/MoE**. Нормировка перед каждой ветвью — RMSNorm, выход ветви прибавляется к residual:
 
 ```math
-h=x+\operatorname{MLA}(N_1(x)),\qquad y=h+\operatorname{FFN/MoE}(N_2(h)).
+h=x+\mathrm{MLA}(N_1(x)),\qquad y=h+\mathrm{FFN/MoE}(N_2(h)).
 ```
 
 $x,h,y$ — hidden states одинаковой ширины, $N_1,N_2$ — разные обученные RMSNorm. Первые три FFN dense, последующие используют MoE: top-8 из 256 routed experts и один shared expert.
@@ -110,7 +110,7 @@ $A$ — MLA либо GDN, $F$ — dense FFN либо MoE; $GN_1,\ldots,GN_4$ —
 
 | Место | Gate |
 |---|---|
-| [GatedNorm](#block-gatednorm) | Нормированный вход $n$ умножается на $2\sigma(W_{down}\operatorname{SiLU}(W_{up}n))$ |
+| [GatedNorm](#block-gatednorm) | Нормированный вход $n$ умножается на $2\sigma(W_{down}\mathrm{SiLU}(W_{up}n))$ |
 | [Выход GDN](#block-gdn) | Каждый head после zero-centered RMSNorm умножается на $2\sigma(z)$ |
 | [Выход MLA](#block-mla) | Склеенные head outputs умножаются на $\sigma(W_{gate}a)$ перед $W_O$, без множителя 2 |
 
@@ -136,7 +136,7 @@ $a=GN_1(x)$ — вход attention-ветви после pre-нормировк�
 | $\varepsilon>0$ | Стабилизатор знаменателя |
 | $\odot,\; ^\top$ | Поэлементное умножение и транспонирование |
 | $\sigma$ | Sigmoid; $\exp$ и $\log$ — экспонента и натуральный логарифм |
-| $\operatorname{Concat}$ | Склейка векторов по feature-оси |
+| $\mathrm{Concat}$ | Склейка векторов по feature-оси |
 
 В формулах отдельные векторы — **столбцы**: $y=Wx+b$. В коде токены обычно хранятся строками: `X @ W.T + b`. Это одна операция при разном соглашении о хранении. В численных примерах запись `[a,b]` обозначает компоненты вектора, а не новое соглашение для формул.
 
@@ -236,8 +236,8 @@ double mean_values(const Vec& x) {
 ### Exp log sqrt и rsqrt
 
 ```math
-\operatorname{exp}(x)=e^x,\quad \operatorname{log}(x)=\ln x,\quad
-\operatorname{sqrt}(x)=\sqrt{x},\quad \operatorname{rsqrt}(x)=1/\sqrt{x}.
+\mathrm{exp}(x)=e^x,\quad \mathrm{log}(x)=\ln x,\quad
+\mathrm{sqrt}(x)=\sqrt{x},\quad \mathrm{rsqrt}(x)=1/\sqrt{x}.
 ```
 
 `log` требует положительного аргумента, `sqrt` — неотрицательного, `rsqrt` — положительного. Примеры: `exp(0)=1`, `log(e)=1`, `sqrt(4)=2`, `rsqrt(4)=0.5`. В коде C++ это `std::exp`, `std::log`, `std::sqrt`, `1.0/std::sqrt(x)`. Для tensor-входа PyTorch применяет функции поэлементно. Они входят в softmax, активации, нормировки и decay GDN.
@@ -333,7 +333,7 @@ $V$ — размер словаря, $E$ — обученная таблица, 
 **LM head** преобразует конечный hidden state в оценки токенов словаря:
 
 ```math
-\ell=W_{vocab}h,\quad W_{vocab}\in\mathbb R^{V\times D},\quad p_i=\operatorname{softmax}(\ell)_i.
+\ell=W_{vocab}h,\quad W_{vocab}\in\mathbb R^{V\times D},\quad p_i=\mathrm{softmax}(\ell)_i.
 ```
 
 $h$ — вектор после последней нормировки, $\ell$ — logits, $p_i$ — вероятность следующего token ID $i$. Например, $h=[1,2]$ и строки $W_{vocab}=[1,0],[0,1],[1,1]$ дают logits `[1,2,3]`. Сам Linear не выполняет softmax. Embedding и LM head могут иметь разные веса; у выбранных checkpoints `tie_word_embeddings=false`.
@@ -384,7 +384,7 @@ $z$ — скалярный вход. Sigmoid даёт коэффициент о�
 ### ReLU
 
 ```math
-\operatorname{ReLU}(z)=\max(0,z).
+\mathrm{ReLU}(z)=\max(0,z).
 ```
 
 Отбрасывает отрицательную часть скалярного входа $z$. Пример: `[-1,0,2] → [0,0,2]`. В [DeepSeek V3.2](#model-deepseek-v32) применяется к QK dot products индексатора DSA. Основные FFN выбранных моделей используют SiLU внутри SwiGLU.
@@ -406,7 +406,7 @@ $z$ — скалярный вход. Sigmoid даёт коэффициент о�
 ### SiLU
 
 ```math
-\operatorname{SiLU}(z)=z\sigma(z).
+\mathrm{SiLU}(z)=z\sigma(z).
 ```
 
 Пример: `[-1,0,2] → [-0.268941,0,1.761594]`. Выход не ограничен диапазоном [0,1]; отрицательные входы не всегда превращаются в ноль. В [SwiGLU](#block-swiglu) SiLU применяется к gate-проекции до умножения на up-проекцию. В GigaChat дополнительно используется после GDN conv и в bottleneck MLP GatedNorm.
@@ -416,7 +416,7 @@ $z$ — скалярный вход. Sigmoid даёт коэффициент о�
 ### Softplus
 
 ```math
-\operatorname{softplus}(z)=\log(1+e^z).
+\mathrm{softplus}(z)=\log(1+e^z).
 ```
 
 Пример: `[-1,0,2] → [0.313262,0.693147,2.126928]`. Даёт положительное число; в [GDN](#block-gdn) из него строится скорость затухания. Устойчивая форма: $\max(z,0)+\log(1+e^{-|z|})$. Она избегает переполнения $e^z$ при больших положительных $z$.
@@ -590,12 +590,12 @@ n=(1+w)\odot\frac{x}{\sqrt{D^{-1}\sum_i x_i^2+\varepsilon}}.
 В GigaChat 3.5 GatedNorm добавляет зависящий от входа поэлементный gate:
 
 ```math
-g=2\sigma\bigl(W_{down}\operatorname{SiLU}(W_{up}n)\bigr),\qquad y=n\odot g.
+g=2\sigma\bigl(W_{down}\mathrm{SiLU}(W_{up}n)\bigr),\qquad y=n\odot g.
 ```
 
 $W_{up}\in\mathbb R^{R_g\times D}$, $W_{down}\in\mathbb R^{D\times R_g}$; $R_g$ — ширина маленького gate-MLP, в этой конфигурации 16. Gate вычисляется из **нормированного** $n$. Если его logits равны нулю, $2\sigma(0)=1$ и gate не меняет масштаб.
 
-**Пример:** $x=[3,4]$, $w=0$ дают $n=[0.848528,1.131371]$. Выберем маленький bottleneck с $W_{up}=[1,0]$ и $W_{down}=[0,\log(3)/\operatorname{SiLU}(n_0)]^\top\approx[0,1.848928]^\top$, чтобы его logits были $[0,\log3]$. Тогда $g=[1,1.5]$, $y\approx[0.848528,1.697056]$.
+**Пример:** $x=[3,4]$, $w=0$ дают $n=[0.848528,1.131371]$. Выберем маленький bottleneck с $W_{up}=[1,0]$ и $W_{down}=[0,\log(3)/\mathrm{SiLU}(n_0)]^\top\approx[0,1.848928]^\top$, чтобы его logits были $[0,\log3]$. Тогда $g=[1,1.5]$, $y\approx[0.848528,1.697056]$.
 
 В коде ниже точный второй коэффициент строится через `log(3)/SiLU(n[0])`; это учебный выбор весов. Реальные веса обучаются. Источник варианта: [GigaChat implementation](https://huggingface.co/ai-sage/GigaChat3.5-432B-A28B/blob/main/modeling_gigachat3_5.py).
 
@@ -701,7 +701,7 @@ tensor([0.500000, 0.500000, 0.000000])
 Для вектора $s\in\mathbb R^N$ операция top-k возвращает $k$ наибольших **значений и их индексы**:
 
 ```math
-I=\operatorname{TopKIndices}(s,k),\qquad v_r=s_{I_r},\quad r=0,\ldots,k-1.
+I=\mathrm{TopKIndices}(s,k),\qquad v_r=s_{I_r},\quad r=0,\ldots,k-1.
 ```
 
 Пример: `s=[0.2,0.7,0.1,0.6]`, `k=2` → values `[0.7,0.6]`, indices `[1,3]`. По умолчанию PyTorch сортирует выбранные values по убыванию; порядок индексов при равных значениях не гарантируется. [Спецификация topk](https://docs.pytorch.org/docs/2.14/generated/torch.topk.html).
@@ -819,7 +819,7 @@ tensor([[[-2.000000,  1.000000]]])
 FFN независимо преобразует каждый токен. Обычная двухслойная форма:
 
 ```math
-\operatorname{FFN}(x)=W_2\varphi(W_1x+b_1)+b_2.
+\mathrm{FFN}(x)=W_2\varphi(W_1x+b_1)+b_2.
 ```
 
 $W_1\in\mathbb R^{M\times D}$ расширяет признаки, $W_2\in\mathbb R^{D\times M}$ возвращает ширину $D$, $\varphi$ — поэлементная активация.
@@ -827,7 +827,7 @@ $W_1\in\mathbb R^{M\times D}$ расширяет признаки, $W_2\in\mathb
 В выбранных моделях dense FFN и отдельные MoE experts используют **SwiGLU**:
 
 ```math
-a=W_gx,\quad u=W_ux,\quad h=\operatorname{SiLU}(a)\odot u,\quad y=W_dh.
+a=W_gx,\quad u=W_ux,\quad h=\mathrm{SiLU}(a)\odot u,\quad y=W_dh.
 ```
 
 $W_g,W_u\in\mathbb R^{M\times D}$, $W_d\in\mathbb R^{D\times M}$. Здесь три Linear. Gate SiLU не ограничен диапазоном `[0,1]`; это не sigmoid gate.
@@ -841,7 +841,7 @@ $W_g,W_u\in\mathbb R^{M\times D}$, $W_d\in\mathbb R^{D\times M}$. Здесь т�
 Для GigaChat 3.5 используется ограничение $L=10$ **до** SiLU и произведения:
 
 ```math
-a\leftarrow\min(a,L),\qquad u\leftarrow\operatorname{clip}(u,-L,L).
+a\leftarrow\min(a,L),\qquad u\leftarrow\mathrm{clip}(u,-L,L).
 ```
 
 Gate ограничен только сверху, up — с обеих сторон. Для $a=[12,-12],u=[15,-15]$ получается $[10,-12]$ и $[10,-10]$. В нашей функции `limit=None` отключает ограничение; это учебный API. [Исходник GigaChat](https://huggingface.co/ai-sage/GigaChat3.5-432B-A28B/blob/main/modeling_gigachat3_5.py).
@@ -890,7 +890,7 @@ Q=XW_Q^\top,\quad K=XW_K^\top,\quad V_a=XW_V^\top,
 
 ```math
 L_{tj}=\frac{q_t^\top k_j}{\sqrt{d_k}}+M_{tj},\qquad
-A_{tj}=\operatorname{softmax}_j(L_{tj}),\qquad o_t=\sum_j A_{tj}v_j.
+A_{tj}=\mathrm{softmax}_j(L_{tj}),\qquad o_t=\sum_j A_{tj}v_j.
 ```
 
 $X\in\mathbb R^{T\times D}$ хранит токены строками; $W_Q,W_K\in\mathbb R^{d_k\times D}$, $W_V\in\mathbb R^{d_v\times D}$. $Q,K$ имеют ширину $d_k$, $V_a$ — $d_v$; обозначение $V_a$ отличает матрицу values от размера словаря $V$. В causal self-attention $M_{tj}=0$ при $j\le t$ и $-\infty$ при $j>t$.
@@ -899,7 +899,7 @@ $q$ описывает текущий запрос, $k$ — признак дл�
 
 **Пример:** $Q=K=I_2$, $V_a=[[10,0],[0,20]]$. Первый токен видит только себя, поэтому $o_0=[10,0]$. Для второго logits `[0,1/√2]`, веса `[0.330238,0.669762]`, выход `[3.302385,13.395231]`.
 
-**Multi-head:** каждый из $H$ heads считает свой выход $o_{t,h}$, затем $y_t=W_O\operatorname{Concat}_h(o_{t,h})$, где $W_O\in\mathbb R^{D\times Hd_v}$. В GQA несколько query-heads разделяют один набор K/V; в MQA один набор K/V общий для всех heads. MLA ниже использует сжатое представление KV.
+**Multi-head:** каждый из $H$ heads считает свой выход $o_{t,h}$, затем $y_t=W_O\mathrm{Concat}_h(o_{t,h})$, где $W_O\in\mathbb R^{D\times Hd_v}$. В GQA несколько query-heads разделяют один набор K/V; в MQA один набор K/V общий для всех heads. MLA ниже использует сжатое представление KV.
 
 **Decode:** одна новая query может видеть весь прежний cache. Поэтому при `T=1,S>1` causal mask должна учитывать абсолютную позицию query; обычная локальная треугольная маска `[1,S]` может ошибочно оставить только первый key.
 
@@ -1007,7 +1007,7 @@ L_{tj,h}=\frac{(q_{t,h}^C)^\top k_{j,h}^C+(q_{t,h}^R)^\top k_j^R}{\sqrt{d_n+d_r}
 ```
 
 ```math
-p_{tj,h}=\operatorname{softmax}_j L_{tj,h},\qquad o_{t,h}=\sum_j p_{tj,h}v_{j,h}.
+p_{tj,h}=\mathrm{softmax}_j L_{tj,h},\qquad o_{t,h}=\sum_j p_{tj,h}v_{j,h}.
 ```
 
 Для decode можно перенести расширяющую K-матрицу на query:
@@ -1084,15 +1084,15 @@ MLA explicit output: tensor([[0.666667, 1.333333]])
 DSA сначала выбирает полезные позиции, затем выполняет MLA по ним. У индексатора свои Q/K и веса heads:
 
 ```math
-I_{tj}=\frac{1}{\sqrt{H_I d_I}}\sum_{h=1}^{H_I}a_{t,h}\operatorname{ReLU}\left((q^I_{t,h})^\top k^I_j\right).
+I_{tj}=\frac{1}{\sqrt{H_I d_I}}\sum_{h=1}^{H_I}a_{t,h}\mathrm{ReLU}\left((q^I_{t,h})^\top k^I_j\right).
 ```
 
 $H_I,d_I$ — количество heads индексатора и их ширина; $q^I_{t,h},k^I_j\in\mathbb R^{d_I}$; $a_{t,h}$ — **сырые** выходы обученного Linear по $x_t$, без sigmoid/softmax. $I_{tj}$ — ranking score для позиции $j$.
 
-Query индексатора получается из $c_t^Q$ MLA; key — из $\operatorname{LayerNorm}(W_{IK}x_j)$. Затем применяют частичный RoPE. В реализации перед FP8 есть общий нормированный Hadamard для Q/K. Его математика и маленький пример приведены в приложении.
+Query индексатора получается из $c_t^Q$ MLA; key — из $\mathrm{LayerNorm}(W_{IK}x_j)$. Затем применяют частичный RoPE. В реализации перед FP8 есть общий нормированный Hadamard для Q/K. Его математика и маленький пример приведены в приложении.
 
 ```math
-J_t=\operatorname{TopKIndices}_{j\le t}(I_{tj},K_s).
+J_t=\mathrm{TopKIndices}_{j\le t}(I_{tj},K_s).
 ```
 
 $K_s$ — число выбираемых токенов, в V3.2 до 2048. Для короткого контекста выбираются все доступные позиции. Набор $J_t$ общий для MLA-heads. После выбора считаются **отдельные MLA logits** и softmax только по $j\in J_t$; index scores не становятся attention weights. [DSA paper](https://arxiv.org/html/2512.02556v1), [official indexer](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py).
@@ -1349,7 +1349,7 @@ k_t=\frac{k_t^{raw}}{\sqrt{\sum_i(k_{t,i}^{raw})^2+\varepsilon}}.
 Коэффициенты конкретного head:
 
 ```math
-\beta_t=\sigma(b_t),\quad g_t=-e^{A_{log}}\operatorname{softplus}(a_t+d_{bias}),\quad \alpha_t=e^{g_t}.
+\beta_t=\sigma(b_t),\quad g_t=-e^{A_{log}}\mathrm{softplus}(a_t+d_{bias}),\quad \alpha_t=e^{g_t}.
 ```
 
 $a_t,b_t$ — скаляры из отдельных проекций текущего входа; $A_{log},d_{bias}$ — обученные параметры head; $g_t$ — логарифм коэффициента сохранения. При $a_t=b_t=A_{log}=d_{bias}=0$ получаем $\alpha_t=\beta_t=0.5$.
@@ -1395,8 +1395,8 @@ S_2=\begin{bmatrix}2.25&.5\\0&0\end{bmatrix},\qquad o_2=[1.590990,0.353553].
 В GigaChat каждый head затем получает zero-centered RMSNorm и gate:
 
 ```math
-u_t=\operatorname{RMSNorm}_{\gamma=1+w}(o_t)\odot 2\sigma(z_t),\qquad
-y_t=W_O\operatorname{Concat}_h(u_{t,h}).
+u_t=\mathrm{RMSNorm}_{\gamma=1+w}(o_t)\odot 2\sigma(z_t),\qquad
+y_t=W_O\mathrm{Concat}_h(u_{t,h}).
 ```
 
 $z_t\in\mathbb R^{d_v}$ — отдельная проекция входа. $u_{t,h}$ — нормированный выход head после gate, $h$ — индекс head, $W_O\in\mathbb R^{D\times(H_vd_v)}$, $H_v$ — число value heads. Это другой gate, чем bottleneck GatedNorm из раздела 5. При $z=0$ множитель равен 1, но сама RMS-нормировка продолжает действовать. Например, $o=[3,4]$, $w=0,z=[0,\log3]$ дают `[0.848528,1.697056]`.
@@ -1478,7 +1478,7 @@ y=x+f(x).
 Схематично блок DeepSeek с pre-norm:
 
 ```math
-h=x+\operatorname{MLA}(N_1(x)),\qquad y=h+\operatorname{FFN/MoE}(N_2(h)).
+h=x+\mathrm{MLA}(N_1(x)),\qquad y=h+\mathrm{FFN/MoE}(N_2(h)).
 ```
 
 $N_1,N_2$ — разные обученные RMSNorm. В V3.2 MLA включает отбор позиций через DSA. На dense-слоях используется FFN, на остальных MoE.
@@ -1486,11 +1486,11 @@ $N_1,N_2$ — разные обученные RMSNorm. В V3.2 MLA включа�
 В GigaChat 3.5 `pre_post` добавляет нормы к выходам ветвей **перед residual add**:
 
 ```math
-h=x+GN_2\bigl(\operatorname{MLA/GDN}(GN_1(x))\bigr),
+h=x+GN_2\bigl(\mathrm{MLA/GDN}(GN_1(x))\bigr),
 ```
 
 ```math
-y=h+GN_4\bigl(\operatorname{FFN/MoE}(GN_3(h))\bigr).
+y=h+GN_4\bigl(\mathrm{FFN/MoE}(GN_3(h))\bigr).
 ```
 
 $GN_1,\ldots,GN_4$ — отдельные GatedNorm с собственными весами. Это не формула $GN(x+f(x))$.
@@ -1541,7 +1541,7 @@ $H_4^\top H_4=I_4$, поэтому $(H_4q)^\top(H_4k)=q^\top k$. Это смен
 ### Квантизация одного FP8 блока
 
 ```math
-q=\operatorname{cast}_{FP8}\bigl(\operatorname{clip}(x/s,-F_{max},F_{max})\bigr),\qquad \hat x=s\operatorname{float}(q).
+q=\mathrm{cast}_{FP8}\bigl(\mathrm{clip}(x/s,-F_{max},F_{max})\bigr),\qquad \hat x=s\mathrm{float}(q).
 ```
 
 $s>0$ — масштаб блока, $F_{max}$ — максимальное конечное число формата, $q$ — FP8-представление, $\hat x$ — восстановленное значение. При E4M3FN $F_{max}=448$. FP8 имеет показатель степени: это не INT8 с равномерным шагом. Например, при $s=1$: `[1.1,2.1,-1.1]` → `[1.125,2,-1.125]`.

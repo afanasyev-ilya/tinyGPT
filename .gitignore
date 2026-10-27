@@ -1,2 +1,3 @@
-final/__pycache__/*
-final/tinygpt_model.pt
+__pycache__/
+*.pyc
+tinyGPT_train/tinygpt_model.pt
