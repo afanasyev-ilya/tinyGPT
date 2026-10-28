@@ -577,7 +577,7 @@ L2 small: tensor([0.707107, 0.000000])
 
 ## 5 Zero centered RMSNorm и GatedNorm
 
-Zero-centered означает параметризацию **масштаба** $\gamma=1+w$: при обучаемом параметре $w=0$ эффективный scale равен 1. Среднее входа при этом не вычитается.
+Zero-centered означает параметризацию **масштаба** $\gamma=1+w$: при обучаемом параметре $w=0$ эффективный scale равен 1. $\gamma$ и $w$ — векторы $[D]$, у каждого канала свой масштаб. Среднее входа при этом не вычитается.
 
 ```math
 n=(1+w)\odot\frac{x}{\sqrt{D^{-1}\sum_i x_i^2+\varepsilon}}.
@@ -587,17 +587,44 @@ n=(1+w)\odot\frac{x}{\sqrt{D^{-1}\sum_i x_i^2+\varepsilon}}.
 
 ### GatedNorm
 
-В GigaChat 3.5 GatedNorm добавляет зависящий от входа поэлементный gate:
+Обычная RMSNorm на этом заканчивается: каждый $x_i$ делится на одно число $r$ (своё для каждого токена) и умножается на свой обученный $\gamma_i$. Здесь $\gamma$ — **вектор** $[D]$, у каждого канала свой масштаб; zero-centered значит только, что хранится $w$, а используется $\gamma=1+w$.
+
+GatedNorm в GigaChat 3.5 добавляет к этому зависящий от входа поэлементный **gate** — множитель от 0 до 2 для каждого канала:
 
 ```math
-g=2\sigma\bigl(W_{down}\mathrm{SiLU}(W_{up}n)\bigr),\qquad y=n\odot g.
+n=\gamma\odot\frac{x}{r},\qquad
+u=W_{up}\,n,\qquad
+g=2\sigma\bigl(W_{down}\,\mathrm{SiLU}(u)\bigr),\qquad
+y=n\odot g.
 ```
 
-$W_{up}\in\mathbb R^{R_g\times D}$, $W_{down}\in\mathbb R^{D\times R_g}$; $R_g$ — ширина маленького gate-MLP, в этой конфигурации 16. Gate вычисляется из **нормированного** $n$. Если его logits равны нулю, $2\sigma(0)=1$ и gate не меняет масштаб.
+Здесь $\sigma(z)=1/(1+e^{-z})$ — [sigmoid](#op-sigmoid), не степень: она переводит любое число в интервал $(0,1)$, а $\sigma(0)=0.5$. Поэтому $2\sigma(\cdot)\in(0,2)$ и $2\sigma(0)=1$. $\mathrm{SiLU}(z)=z\,\sigma(z)$ — [SiLU](#op-silu).
 
-**Пример:** $x=[3,4]$, $w=0$ дают $n=[0.848528,1.131371]$. Выберем маленький bottleneck с $W_{up}=[1,0]$ и $W_{down}=[0,\log(3)/\mathrm{SiLU}(n_0)]^\top\approx[0,1.848928]^\top$, чтобы его logits были $[0,\log3]$. Тогда $g=[1,1.5]$, $y\approx[0.848528,1.697056]$.
+**Шейпы.** $D$ — hidden size (7168 в GigaChat 4), $R_g$ — ширина gate-MLP (16):
 
-В коде ниже точный второй коэффициент строится через `log(3)/SiLU(n[0])`; это учебный выбор весов. Реальные веса обучаются. Источник варианта: [GigaChat implementation](https://huggingface.co/ai-sage/GigaChat3.5-432B-A28B/blob/main/modeling_gigachat3_5.py).
+| Величина | Шейп для одного токена | Для batch из $T$ токенов |
+|---|---|---|
+| $x,\ n,\ g,\ y$ | $[D]$ | $[T,D]$ |
+| $\gamma=1+w$ | $[D]$ | $[D]$, общий для всех токенов |
+| $W_{up}$ (`gate_up`) | $[R_g,D]=[16,7168]$ | тот же |
+| $u=W_{up}n,\ \mathrm{SiLU}(u)$ | $[R_g]=[16]$ | $[T,16]$: `n @ gate_up.T` |
+| $W_{down}$ (`gate_down`) | $[D,R_g]=[7168,16]$ | тот же |
+| logits $W_{down}\mathrm{SiLU}(u)$ | $[D]$ | $[T,D]$: `silu(...) @ gate_down.T` |
+
+Токены не смешиваются: каждая строка $[D]$ нормируется и гейтится независимо, batch только превращает матвек в маленькие матмулы.
+
+**Зачем это нужно.** Обычная RMSNorm выравнивает только общую «громкость» вектора, а $\gamma$ одинакова для всех токенов. Gate позволяет модели **для каждого токена отдельно** приглушать одни каналы и усиливать другие: узкое горло $D\to16\to D$ смотрит на нормированный вход и решает, что пропустить дальше в attention или MoE. Это дёшево — около $2\cdot16\cdot D$ умножений на токен против $\sim D^2$ у любой проекции — и безопасно для обучения: при нулевых logits $g=1$, то есть GatedNorm стартует как обычная RMSNorm, а множитель ограничен интервалом $(0,2)$ и не может «взорваться». Типичная мотивация таких gates — гасить каналы с выбросами (massive activations), которые мешают стабильности обучения и квантованию; похожий эффект описан для sigmoid-gate на выходе attention ([Gated Attention for LLMs](https://arxiv.org/abs/2505.06708)). Официального обоснования именно GatedNorm в коде GigaChat нет, это объяснение по аналогии.
+
+**Сколько редукций.** Сумм по всей строке здесь не одна, а $1+R_g=17$: $\sum_i x_i^2$ для $r$ и 16 скалярных произведений $W_{up}n$, каждое длины $D$. Всё после $u$ — поэлементное. Для fused-ядра важно, что $1/r$ — одно число на строку и выносится из линейного $W_{up}$: $W_{up}n=\tfrac1r\,W_{up}(\gamma\odot x)$. Поэтому все 17 сумм копятся **за один проход** по $x$, ещё до того как известен $r$.
+
+**Пример.** $D=4$, $R_g=1$, $w=0$ ($\gamma=1$):
+
+1. RMSNorm: $x=[1,2,2,4]$, $\sum x_i^2=25$, $r=\sqrt{25/4}=2.5$, $n=[0.4,0.8,0.8,1.6]$.
+2. Bottleneck: $W_{up}=[1,0,0,1]$ (шейп $[1,4]$) даёт $u=0.4+1.6=2$, $\mathrm{SiLU}(2)=2\sigma(2)\approx1.761594$.
+3. Gate: $W_{down}=[0,0,0,-1]^\top$ (шейп $[4,1]$) даёт logits $[0,0,0,-1.761594]$ и $g=2\sigma(\text{logits})\approx[1,1,1,0.293182]$.
+4. Выход: $y=n\odot g\approx[0.4,0.8,0.8,0.469091]$ — первые три канала прошли без изменений, четвёртый приглушён примерно в 3.4 раза.
+
+Реальные веса обучаются; здесь они выбраны вручную, чтобы gate было видно. Источник варианта: [GigaChat implementation](https://huggingface.co/ai-sage/GigaChat3.5-432B-A28B/blob/main/modeling_gigachat3_5.py).
 
 **C++17.**
 
@@ -614,25 +641,27 @@ def gated_norm(x, zero_weight, gate_up, gate_down, eps=1e-6):
     # zero-centered: эффективная gamma = 1 + zero_weight.
     n = rms_norm(x, 1.0 + zero_weight, eps)
     # A @ B: матричное произведение; .T: транспонирование 2D-матрицы.
+    # [D] @ [D, R_g] -> [R_g];  [R_g] @ [R_g, D] -> [D]
     gate_logits = F.silu(n @ gate_up.T) @ gate_down.T
     return n * (2.0 * torch.sigmoid(gate_logits))
 ```
 
 ```python
-x = torch.tensor([3., 4.])
+x = torch.tensor([1., 2., 2., 4.])
+gate_up = torch.tensor([[1., 0., 0., 1.]])             # W_up:   [R_g=1, D=4]
+gate_down = torch.tensor([[0.], [0.], [0.], [-1.]])   # W_down: [D=4, R_g=1]
 n = rms_norm(x)
-gate_up = torch.tensor([[1., 0.]])
-gate_down = torch.tensor([[0.], [math.log(3) / float(F.silu(n[0]))]])
-print("gate_down:", gate_down)
-print("GatedNorm:", gated_norm(x, torch.zeros(2), gate_up, gate_down))
+print("n:", n)
+print("g:", 2.0 * torch.sigmoid(F.silu(n @ gate_up.T) @ gate_down.T))
+print("GatedNorm:", gated_norm(x, torch.zeros(4), gate_up, gate_down))
 ```
 
 Вывод примера:
 
 ```text
-gate_down: tensor([[0.000000],
-        [1.848928]])
-GatedNorm: tensor([0.848528, 1.697056])
+n: tensor([0.400000, 0.800000, 0.800000, 1.600000])
+g: tensor([1.000000, 1.000000, 1.000000, 0.293182])
+GatedNorm: tensor([0.400000, 0.800000, 0.800000, 0.469091])
 ```
 
 <a name="op-softmax"></a>
