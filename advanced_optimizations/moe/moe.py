@@ -130,6 +130,23 @@ class Expert(nn.Module):
 
     Отличие от FeedForward из tinyGPT: вместо ReLU стоит SwiGLU,
     silu(g) * u. Первая матрица выдаёт сразу и g, и u.
+
+    Зачем две Linear, а не одна. Две Linear подряд без нелинейности между
+    ними — это снова одна Linear (W2 @ W1 — просто матрица), то есть никакой
+    новой выразительности. Поэтому схема "расширить -> нелинейность -> сжать":
+    W1 поднимает токен из C в пространство признаков размера I, там
+    нелинейность решает, какие признаки оставить, W2 возвращает обратно в C,
+    чтобы результат можно было прибавить к residual.
+
+    Зачем silu(g) * u (SwiGLU), а не ReLU(x). Это гейт: u — "что передать",
+    silu(g) — "насколько открыть канал". silu(g) = g * sigmoid(g): при
+    g >> 0 почти g (канал открыт), при g << 0 почти 0 (канал закрыт), между
+    ними плавно, без излома ReLU. Гейт зависит от входа, поэтому эксперт сам
+    выбирает, какие из I каналов использовать для этого токена. На практике
+    это заметно лучше ReLU при том же числе параметров (Shazeer, "GLU
+    Variants Improve Transformer", 2020); так делают LLaMA, DeepSeek, GigaChat.
+    W1 выдаёт g и u одной матрицей [2I, C] — это просто две проекции,
+    склеенные в один GEMM.
     """
 
     def __init__(self, n_embd, expert_hidden):
@@ -142,10 +159,44 @@ class Expert(nn.Module):
         self.w2 = nn.Linear(expert_hidden, n_embd, bias=False)
 
     def forward(self, h):
-        # h: (N, C), только те токены, которые выбрали этого эксперта
+        # h: (N, C), только те токены, которые выбрали этого эксперта.
+        #
+        # toy: эксперт 2 из MoE.forward, C = 4, I = 2, его мини-батч — оба токена:
+        #   h = [[1.0,  0.0, -1.0,  2.0],     # токен 0
+        #        [2.4, -3.0,  1.0, -1.8]]     # токен 1
+        #   W1 = [[1.0, 0,  0, 0.5],          # строка g0
+        #         [0,   1, -1, 0  ],          # строка g1
+        #         [0.5, 0,  0, 0  ],          # строка u0
+        #         [0,   0,  0, 1  ]]          # строка u1
+        #   W2 = [[1, 0],
+        #         [0, 1],
+        #         [1,-1],
+        #         [0, 0.5]]
+
+        # FC1: каждая из 2*I строк W1 — скалярное произведение с h.
+        #   токен 0: g0 = 1*1 + 2*0.5 = 2.0, g1 = 0 - (-1) = 1.0,
+        #            u0 = 0.5*1 = 0.5,       u1 = 2.0
+        #   токен 1: g0 = 2.4 - 0.9 = 1.5,   g1 = -3 - 1 = -4.0,
+        #            u0 = 1.2,               u1 = -1.8
+        #   gu = [[2.0,  1.0, 0.5,  2.0],
+        #         [1.5, -4.0, 1.2, -1.8]]
         gu = self.w1(h)               # (N, 2*I)
         g, u = gu.chunk(2, dim=-1)    # (N, I), (N, I)
-        a = F.silu(g) * u             # (N, I); silu(g) = g * sigmoid(g)
+
+        # SwiGLU: silu(g) = g * sigmoid(g)
+        #   g = 2.0:  2.0 * 0.881 =  1.762      g = 1.0:  1.0 * 0.731 =  0.731
+        #   g = 1.5:  1.5 * 0.818 =  1.226      g = -4.0: -4.0 * 0.018 = -0.072
+        #   a = silu(g) * u:
+        #     токен 0: [1.762 * 0.5, 0.731 * 2.0]   = [0.881, 1.462]
+        #     токен 1: [1.226 * 1.2, -0.072 * -1.8] = [1.472, 0.130]
+        #   У токена 1 канал 1 почти закрыт (g1 = -4): что бы ни было в u1,
+        #   в выход проходит только 0.130.
+        a = F.silu(g) * u             # (N, I)
+
+        # FC2: обратно в C.
+        #   токен 0: y = [0.881, 1.462, 0.881 - 1.462, 0.5 * 1.462]
+        #              = [0.881, 1.462, -0.581, 0.731]
+        #   токен 1: y = [1.472, 0.130, 1.342, 0.065]
         return self.w2(a)             # (N, C)
 
 
@@ -301,12 +352,49 @@ class MoE(nn.Module):
         # В TRT-LLM / MegaMoE dispatch и combine идут между GPU (эксперты
         # разложены по рангам), а здесь — простой цикл.
         for e, expert in enumerate(self.experts):
-            token_ids, slot = (idx == e).nonzero(as_tuple=True)  # (n_e,), (n_e,)
+            # Кто выбрал эксперта e. idx == e — маска (N, k): True там, где в
+            # списке токена стоит e. nonzero даёт координаты всех True:
+            #   token_ids — номер токена (строка idx),
+            #   slot      — на каком месте из k этот эксперт у токена (столбец idx).
+            # Обе формы torch.Size([n_e]), n_e — сколько токенов выбрало e.
+            #   toy, idx = [[2, 3],
+            #               [2, 0]]:
+            #     e = 0: маска [[F, F], [F, T]] -> token_ids = [1],    slot = [1]  Size([1])
+            #     e = 1: маска вся False        -> token_ids = [],     slot = []   Size([0])
+            #     e = 2: маска [[T, F], [T, F]] -> token_ids = [0, 1], slot = [0, 0]  Size([2])
+            #     e = 3: маска [[F, T], [F, F]] -> token_ids = [0],    slot = [1]  Size([1])
+            # slot нужен, чтобы взять правильный вес: у токена 0 эксперт 3
+            # стоит вторым, поэтому его вес w[0, 1], а не w[0, 0].
+            token_ids, slot = (idx == e).nonzero(as_tuple=True)
             if token_ids.numel() == 0:
-                continue
-            y = expert(h[token_ids])                      # (n_e, C)
-            y = y * w[token_ids, slot].unsqueeze(-1)      # (n_e, C) * (n_e, 1)
-            out = out.index_add(0, token_ids, y)          # combine
+                continue            # e = 1: эксперт пропущен, его W1/W2 не читаются
+
+            # Мини-батч эксперта: только его строки h.
+            #   e = 2: h[[0, 1]] -> torch.Size([2, 4]), оба токена
+            #   e = 3: h[[0]]    -> torch.Size([1, 4])
+            # Математика внутри эксперта — в Expert.forward; там же toy для
+            # e = 2, который даёт
+            #   y = [[0.881, 1.462, -0.581, 0.731],    # токен 0
+            #        [1.472, 0.130,  1.342, 0.065]]    # токен 1
+            y = expert(h[token_ids])                      # torch.Size([n_e, C])
+
+            # w[token_ids, slot] — это НЕ параметры эксперта, а веса роутера:
+            # их посчитал self.router в начале forward, ещё до экспертов
+            # (gate GEMM -> sigmoid -> top-k -> нормировка). Они говорят,
+            # насколько сильно вклад этого эксперта входит в выход токена.
+            # Эксперт выдаёт "что" (вектор y), роутер — "сколько" (число w).
+            # Индексация парами: берём w[token_ids[i], slot[i]] для каждого i.
+            #   e = 2: w[[0, 1], [0, 0]] = [w[0, 0], w[1, 0]] = [1.150, 1.211]
+            #   e = 3: w[[0], [1]]       = [w[0, 1]]          = [1.350]
+            # unsqueeze(-1): Size([n_e]) -> Size([n_e, 1]), чтобы умножить
+            # каждую строку y на свой вес (broadcast по C):
+            #   e = 2: [[1.150],     * y ->  [[1.013, 1.681, -0.669, 0.841],
+            #           [1.211]]              [1.782, 0.157,  1.625, 0.078]]
+            y = y * w[token_ids, slot].unsqueeze(-1)      # Size([n_e, C]) * Size([n_e, 1])
+
+            # Combine: прибавить строку i результата в строку token_ids[i] выхода.
+            #   e = 2: out[0] += y[0], out[1] += y[1]
+            out = out.index_add(0, token_ids, y)          # Size([N, C])
 
         return out.view(B, T, C)
 
@@ -407,7 +495,38 @@ def toy_router_example():
     print("  load     =", router.last_expert_load.tolist())
 
 
+@torch.no_grad()
+def toy_expert_example():
+    """Печатает toy-пример из комментариев Expert.forward и MoE.forward (эксперт 2)."""
+    expert = Expert(n_embd=4, expert_hidden=2)
+    expert.w1.weight.copy_(torch.tensor([[1.0, 0, 0, 0.5],
+                                         [0, 1, -1, 0],
+                                         [0.5, 0, 0, 0],
+                                         [0, 0, 0, 1]]))
+    expert.w2.weight.copy_(torch.tensor([[1.0, 0], [0, 1], [1, -1], [0, 0.5]]))
+    h = torch.tensor([[1.0, 0.0, -1.0, 2.0],
+                      [2.4, -3.0, 1.0, -1.8]])
+    idx = torch.tensor([[2, 3], [2, 0]])
+    w = torch.tensor([[1.150, 1.350], [1.211, 1.289]])
+    print("toy expert example")
+    for e in range(4):
+        token_ids, slot = (idx == e).nonzero(as_tuple=True)
+        print(f"  e = {e}: token_ids = {token_ids.tolist()}, slot = {slot.tolist()}, "
+              f"shape {tuple(token_ids.shape)}, w = {w[token_ids, slot].tolist()}")
+    gu = expert.w1(h)
+    g, u = gu.chunk(2, dim=-1)
+    a = F.silu(g) * u
+    y = expert.w2(a)
+    r = lambda t: [[round(v, 3) for v in row] for row in t.tolist()]
+    print("  gu       =", r(gu))
+    print("  silu(g)  =", r(F.silu(g)))
+    print("  a        =", r(a))
+    print("  y        =", r(y))
+    print("  y * w    =", r(y * w[[0, 1], [0, 0]].unsqueeze(-1)))
+
+
 toy_router_example()
+toy_expert_example()
 
 model = BigramLanguageModel(vocab_size)
 m = model.to(device)
